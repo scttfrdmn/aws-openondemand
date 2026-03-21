@@ -419,6 +419,7 @@ export class OodStack extends cdk.Stack {
             "ssm:GetParameters",
           ],
           resources: [
+            `arn:aws:ssm:${this.region}:${this.account}:parameter/ood/${props.environment}`,
             `arn:aws:ssm:${this.region}:${this.account}:parameter/ood/${props.environment}/*`,
           ],
         })
@@ -428,6 +429,31 @@ export class OodStack extends cdk.Stack {
     // DynamoDB UID table access
     if (enableDynamodbUid && uidTable) {
       uidTable.grantReadWriteData(instanceRole);
+    }
+
+    // EFS mount access (ClientMount + DescribeMountTargets for IAM auth DNS fallback)
+    if (enableEfs && homeFs && homeAccessPoint) {
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "elasticfilesystem:ClientMount",
+            "elasticfilesystem:ClientWrite",
+            "elasticfilesystem:ClientRootAccess",
+          ],
+          resources: [homeFs.fileSystemArn],
+          conditions: {
+            StringEquals: {
+              "elasticfilesystem:AccessPointArn": homeAccessPoint.accessPointArn,
+            },
+          },
+        })
+      );
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["elasticfilesystem:DescribeMountTargets"],
+          resources: [homeFs.fileSystemArn],
+        })
+      );
     }
 
     // S3 browser access
