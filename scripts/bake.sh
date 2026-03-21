@@ -119,9 +119,13 @@ if curl -fsSL --head "${OIDC_PAM_TGZ_URL}" 2>/dev/null | grep -q "200\|302"; the
   tar -xz -C /usr/local/bin/ -f "${TGZ}"
   rm -rf "${TMPDIR}"
   chmod 755 /usr/local/bin/oidc-pam /usr/local/bin/oidc-auth-broker 2>/dev/null || true
-  # Verify extraction succeeded
+  # Verify extraction succeeded and binary is functional (L4)
   if [ ! -f /usr/local/bin/oidc-pam ] || [ ! -x /usr/local/bin/oidc-pam ]; then
     echo "ERROR: oidc-pam binary missing or not executable after extraction"
+    exit 1
+  fi
+  if ! /usr/local/bin/oidc-pam --version > /dev/null 2>&1; then
+    echo "ERROR: oidc-pam binary failed smoke test — binary may be corrupted"
     exit 1
   fi
   echo "=== oidc-pam ${OIDC_PAM_VERSION} installed ==="

@@ -248,6 +248,15 @@ variable "enable_parameter_store" {
   description = "Store runtime configuration in SSM Parameter Store and source at instance launch"
 }
 
+# H2: provide a pre-deployed rotation Lambda ARN to enable automatic OIDC client
+# secret rotation. Without this, the secret must be rotated manually.
+# See docs/identity-guide.md for instructions on building the rotation Lambda.
+variable "oidc_secret_rotation_lambda_arn" {
+  type        = string
+  default     = ""
+  description = "ARN of a Lambda function to rotate the Cognito OIDC client secret. Empty = no automatic rotation (manual rotation required every 90 days)."
+}
+
 # ---------------------------------------------------------------------------
 # Sizing overrides (normally controlled by environment)
 # ---------------------------------------------------------------------------

@@ -382,6 +382,24 @@ resource "aws_iam_role_policy" "ssm_params" {
   })
 }
 
+# M6: allow instance to write SSM session transcripts to S3
+resource "aws_iam_role_policy" "ssm_session_s3" {
+  count       = var.enable_monitoring ? 1 : 0
+  name_prefix = "ood-ssm-session-s3-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = ["s3:PutObject", "s3:GetEncryptionConfiguration"]
+      Resource = [
+        aws_s3_bucket.ssm_sessions[0].arn,
+        "${aws_s3_bucket.ssm_sessions[0].arn}/sessions/*",
+      ]
+    }]
+  })
+}
+
 # Secrets Manager: fetch OIDC client secret at runtime (H2)
 resource "aws_iam_role_policy" "secrets_manager" {
   count       = var.use_cognito ? 1 : 0
@@ -587,6 +605,13 @@ resource "aws_cognito_user_pool" "ood" {
     temporary_password_validity_days = 7
   }
 
+  # M5: enable software TOTP MFA — optional so existing users without MFA can
+  # still authenticate; recommend REQUIRED for prod after initial rollout
+  mfa_configuration = "OPTIONAL"
+  software_token_mfa_configuration {
+    enabled = true
+  }
+
   account_recovery_setting {
     recovery_mechanism {
       name     = "verified_email"
@@ -596,6 +621,10 @@ resource "aws_cognito_user_pool" "ood" {
 
   admin_create_user_config {
     allow_admin_create_user_only = true
+  }
+
+  lifecycle {
+    prevent_destroy = true # M10: user pool contains identity mappings; accidental destroy loses all users
   }
 }
 
@@ -680,6 +709,10 @@ resource "aws_dynamodb_table" "uid_map" {
 
   tags = {
     Name = "oid-uid-map-${var.environment}"
+  }
+
+  lifecycle {
+    prevent_destroy = true # M10: PITR recovers rows; this prevents accidental table drop
   }
 }
 
@@ -771,6 +804,10 @@ resource "aws_elasticache_replication_group" "ood" {
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
   auth_token                 = random_password.redis_auth[0].result
+
+  # M4: retain daily snapshots so session-cache nodes can be rebuilt with data
+  snapshot_retention_limit = var.environment == "prod" ? 14 : 1
+  snapshot_window          = "05:00-06:00"
 
   tags = {
     Name = "ood-session-cache-${var.environment}"
@@ -904,6 +941,19 @@ resource "aws_secretsmanager_secret_version" "oidc_client_secret" {
   count         = var.use_cognito ? 1 : 0
   secret_id     = aws_secretsmanager_secret.oidc_client_secret[0].id
   secret_string = aws_cognito_user_pool_client.ood[0].client_secret
+}
+
+# H2: automatic rotation — requires a Lambda that regenerates the Cognito app client
+# secret and updates the Secrets Manager value. Wire via oidc_secret_rotation_lambda_arn.
+# Without a Lambda, ops must manually rotate every 90 days and update the secret version.
+resource "aws_secretsmanager_secret_rotation" "oidc_client_secret" {
+  count               = var.use_cognito && var.oidc_secret_rotation_lambda_arn != "" ? 1 : 0
+  secret_id           = aws_secretsmanager_secret.oidc_client_secret[0].id
+  rotation_lambda_arn = var.oidc_secret_rotation_lambda_arn
+
+  rotation_rules {
+    automatically_after_days = 90
+  }
 }
 
 # SSM pointer to the Secrets Manager ARN (non-sensitive — just a name/ARN)
@@ -1311,9 +1361,29 @@ resource "aws_wafv2_web_acl" "ood" {
     }
   }
 
+  # M2: block IPs on the AWS threat intelligence list before all other rules
+  rule {
+    name     = "IpReputationList"
+    priority = 1
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesAmazonIpReputationList"
+        vendor_name = "AWS"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "IpReputationList"
+      sampled_requests_enabled   = true
+    }
+  }
+
   rule {
     name     = "CommonRuleSet"
-    priority = 1
+    priority = 2
     override_action {
       none {}
     }
@@ -1332,7 +1402,7 @@ resource "aws_wafv2_web_acl" "ood" {
 
   rule {
     name     = "KnownBadInputs"
-    priority = 2
+    priority = 3
     override_action {
       none {}
     }
@@ -1351,7 +1421,7 @@ resource "aws_wafv2_web_acl" "ood" {
 
   rule {
     name     = "SQLiProtection"
-    priority = 3
+    priority = 4
     override_action {
       none {}
     }
@@ -1451,6 +1521,48 @@ resource "aws_vpc_endpoint" "interfaces" {
 # ---------------------------------------------------------------------------
 # CloudFront (optional)
 # ---------------------------------------------------------------------------
+
+# M1: S3 bucket for CloudFront access logs
+resource "aws_s3_bucket" "cdn_logs" {
+  count         = var.enable_cdn && var.enable_alb ? 1 : 0
+  bucket_prefix = "ood-cdn-logs-${var.environment}-"
+  tags          = { Name = "ood-cdn-logs-${var.environment}" }
+}
+
+resource "aws_s3_bucket_public_access_block" "cdn_logs" {
+  count                   = var.enable_cdn && var.enable_alb ? 1 : 0
+  bucket                  = aws_s3_bucket.cdn_logs[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_ownership_controls" "cdn_logs" {
+  count  = var.enable_cdn && var.enable_alb ? 1 : 0
+  bucket = aws_s3_bucket.cdn_logs[0].id
+  rule { object_ownership = "BucketOwnerPreferred" }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "cdn_logs" {
+  count  = var.enable_cdn && var.enable_alb ? 1 : 0
+  bucket = aws_s3_bucket.cdn_logs[0].id
+  rule {
+    apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "cdn_logs" {
+  count  = var.enable_cdn && var.enable_alb ? 1 : 0
+  bucket = aws_s3_bucket.cdn_logs[0].id
+  rule {
+    id     = "expire-cdn-logs"
+    status = "Enabled"
+    filter {}
+    expiration { days = var.environment == "prod" ? 365 : 90 }
+  }
+}
+
 resource "aws_cloudfront_distribution" "ood" {
   count = var.enable_cdn && var.enable_alb ? 1 : 0
 
@@ -1513,6 +1625,13 @@ resource "aws_cloudfront_distribution" "ood" {
     geo_restriction { restriction_type = "none" }
   }
 
+  # M1: enable CDN access logging
+  logging_config {
+    bucket          = aws_s3_bucket.cdn_logs[0].bucket_domain_name
+    prefix          = "cdn-logs/"
+    include_cookies = false
+  }
+
   viewer_certificate {
     cloudfront_default_certificate = local.alb_cert_arn == ""
     acm_certificate_arn            = local.alb_cert_arn != "" ? local.alb_cert_arn : null
@@ -1569,6 +1688,40 @@ resource "aws_sns_topic_subscription" "email" {
   endpoint  = var.alarm_email
 }
 
+# L7: SQS dead-letter queue captures alarm notifications if delivery fails.
+# Alarms published to SNS are also forwarded here, so they are never silently lost.
+resource "aws_sqs_queue" "alarm_dlq" {
+  count                     = var.enable_monitoring ? 1 : 0
+  name                      = "ood-alarm-dlq-${var.environment}"
+  message_retention_seconds = 1209600 # 14 days
+  kms_master_key_id         = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+
+  tags = { Name = "ood-alarm-dlq-${var.environment}" }
+}
+
+resource "aws_sqs_queue_policy" "alarm_dlq" {
+  count     = var.enable_monitoring ? 1 : 0
+  queue_url = aws_sqs_queue.alarm_dlq[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "sns.amazonaws.com" }
+      Action    = "sqs:SendMessage"
+      Resource  = aws_sqs_queue.alarm_dlq[0].arn
+      Condition = { ArnEquals = { "aws:SourceArn" = aws_sns_topic.ood[0].arn } }
+    }]
+  })
+}
+
+resource "aws_sns_topic_subscription" "sqs_dlq" {
+  count     = var.enable_monitoring ? 1 : 0
+  topic_arn = aws_sns_topic.ood[0].arn
+  protocol  = "sqs"
+  endpoint  = aws_sqs_queue.alarm_dlq[0].arn
+}
+
 resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   count               = var.enable_monitoring ? 1 : 0
   alarm_name          = "ood-${var.environment}-cpu-high"
@@ -1581,6 +1734,7 @@ resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   threshold           = var.environment == "prod" ? 70 : 80
   alarm_description   = "OOD ${var.environment} CPU > threshold"
   alarm_actions       = [aws_sns_topic.ood[0].arn]
+  treat_missing_data  = "breaching" # M7: missing data = instance not publishing = alarm fires
   dimensions = {
     AutoScalingGroupName = aws_autoscaling_group.ood.name
   }
@@ -1598,6 +1752,7 @@ resource "aws_cloudwatch_metric_alarm" "instance_status" {
   threshold           = 0
   alarm_description   = "OOD ${var.environment} instance status check failed"
   alarm_actions       = [aws_sns_topic.ood[0].arn]
+  treat_missing_data  = "breaching" # M7
   dimensions = {
     AutoScalingGroupName = aws_autoscaling_group.ood.name
   }
@@ -1649,6 +1804,50 @@ resource "aws_cloudwatch_log_group" "ssm_sessions" {
   tags = { Name = "ood-ssm-sessions-${var.environment}" }
 }
 
+# M6: S3 bucket for SSM session transcript dual-destination logging
+resource "aws_s3_bucket" "ssm_sessions" {
+  count         = var.enable_monitoring ? 1 : 0
+  bucket_prefix = "ood-ssm-sessions-${var.environment}-"
+  tags          = { Name = "ood-ssm-sessions-${var.environment}" }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "ssm_sessions" {
+  count                   = var.enable_monitoring ? 1 : 0
+  bucket                  = aws_s3_bucket.ssm_sessions[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "ssm_sessions" {
+  count  = var.enable_monitoring ? 1 : 0
+  bucket = aws_s3_bucket.ssm_sessions[0].id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = var.enable_kms_cmk ? "aws:kms" : "AES256"
+      kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "ssm_sessions" {
+  count  = var.enable_monitoring ? 1 : 0
+  bucket = aws_s3_bucket.ssm_sessions[0].id
+  rule {
+    id     = "expire-sessions"
+    status = "Enabled"
+    filter {}
+    expiration {
+      days = var.environment == "prod" ? 365 : 90
+    }
+  }
+}
+
 resource "aws_ssm_document" "session_manager_prefs" {
   count         = var.enable_monitoring ? 1 : 0
   name          = "SSM-SessionManagerRunShell-ood-${var.environment}"
@@ -1656,15 +1855,15 @@ resource "aws_ssm_document" "session_manager_prefs" {
 
   content = jsonencode({
     schemaVersion = "1.0"
-    description   = "OOD ${var.environment} SSM session preferences — logs to CloudWatch"
+    description   = "OOD ${var.environment} SSM session preferences — dual logging to CloudWatch + S3"
     sessionType   = "Standard_Stream"
     inputs = {
       cloudWatchLogGroupName      = aws_cloudwatch_log_group.ssm_sessions[0].name
       cloudWatchEncryptionEnabled = var.enable_kms_cmk
       cloudWatchStreamingEnabled  = true
-      s3BucketName                = ""
-      s3KeyPrefix                 = ""
-      s3EncryptionEnabled         = false
+      s3BucketName                = aws_s3_bucket.ssm_sessions[0].id # M6
+      s3KeyPrefix                 = "sessions/"
+      s3EncryptionEnabled         = true
     }
   })
 
@@ -1944,7 +2143,7 @@ resource "aws_cloudtrail" "ood" {
   is_multi_region_trail         = true # Always multi-region — cross-region calls invisible otherwise (H3)
   enable_log_file_validation    = true
 
-  # Data events: audit S3 object access and Lambda invocations (H4)
+  # M3: audit S3 object access and Lambda invocations (adapter functions)
   event_selector {
     read_write_type           = "All"
     include_management_events = true
@@ -1952,6 +2151,11 @@ resource "aws_cloudtrail" "ood" {
     data_resource {
       type   = "AWS::S3::Object"
       values = ["arn:aws:s3:::"] # All S3 objects — narrow to specific buckets if cost is a concern
+    }
+
+    data_resource {
+      type   = "AWS::Lambda::Function"
+      values = ["arn:aws:lambda"] # All Lambda functions in this account/region
     }
   }
 

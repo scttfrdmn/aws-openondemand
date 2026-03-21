@@ -242,11 +242,12 @@ export class OodStack extends cdk.Stack {
           requireDigits: true,
           requireSymbols: true,
         },
+        // M5: TOTP MFA — OPTIONAL allows existing users to authenticate while
+        // encouraging enrollment; flip to REQUIRED after initial rollout
+        mfa: cognito.Mfa.OPTIONAL,
+        mfaSecondFactor: { otp: true, sms: false },
         accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
-        removalPolicy:
-          props.environment === "prod"
-            ? cdk.RemovalPolicy.RETAIN
-            : cdk.RemovalPolicy.DESTROY,
+        removalPolicy: cdk.RemovalPolicy.RETAIN, // M10: always RETAIN — pool contains all user identities
       });
 
       const callbackUrl =
@@ -445,7 +446,7 @@ export class OodStack extends cdk.Stack {
       );
     }
 
-    // DynamoDB UID table access (explicit — no Scan permission)
+    // DynamoDB UID table access (explicit — no Scan, no DeleteItem: H1)
     if (enableDynamodbUid && uidTable) {
       instanceRole.addToPrincipalPolicy(
         new iam.PolicyStatement({
@@ -453,8 +454,10 @@ export class OodStack extends cdk.Stack {
             "dynamodb:GetItem",
             "dynamodb:PutItem",
             "dynamodb:UpdateItem",
-            "dynamodb:DeleteItem",
             "dynamodb:Query",
+            // DeleteItem intentionally omitted: UID mappings must not be deletable
+            // by the portal instance to prevent identity erasure. Use the console
+            // or a separate admin role for deprovisioning.
           ],
           resources: [uidTable.tableArn],
         })
@@ -514,6 +517,8 @@ export class OodStack extends cdk.Stack {
             `arn:aws:batch:${this.region}:${this.account}:job-queue/ood-${props.environment}*`,
             `arn:aws:batch:${this.region}:${this.account}:job-definition/ood-${props.environment}*`,
           ],
+          // L6: prevent cross-region job submission
+          conditions: { StringEquals: { "aws:RequestedRegion": this.region } },
         })
       );
       // Read-only: needs "*" for describe/list
@@ -526,6 +531,7 @@ export class OodStack extends cdk.Stack {
             "batch:DescribeJobQueues",
           ],
           resources: ["*"],
+          conditions: { StringEquals: { "aws:RequestedRegion": this.region } },
         })
       );
     }
@@ -542,6 +548,8 @@ export class OodStack extends cdk.Stack {
           resources: [
             `arn:aws:sagemaker:${this.region}:${this.account}:domain/ood-${props.environment}*`,
           ],
+          // L6: prevent cross-region SageMaker app creation
+          conditions: { StringEquals: { "aws:RequestedRegion": this.region } },
         })
       );
       // Read-only: needs "*" for describe/list
@@ -549,6 +557,7 @@ export class OodStack extends cdk.Stack {
         new iam.PolicyStatement({
           actions: ["sagemaker:DescribeApp", "sagemaker:ListApps"],
           resources: ["*"],
+          conditions: { StringEquals: { "aws:RequestedRegion": this.region } },
         })
       );
     }
@@ -825,9 +834,26 @@ export class OodStack extends cdk.Stack {
               sampledRequestsEnabled: true,
             },
           },
+          // M2: block IPs on the AWS threat intelligence list before other rules
+          {
+            name: "IpReputationList",
+            priority: 1,
+            overrideAction: { none: {} },
+            statement: {
+              managedRuleGroupStatement: {
+                name: "AWSManagedRulesAmazonIpReputationList",
+                vendorName: "AWS",
+              },
+            },
+            visibilityConfig: {
+              cloudWatchMetricsEnabled: true,
+              metricName: "IpReputationList",
+              sampledRequestsEnabled: true,
+            },
+          },
           {
             name: "CommonRuleSet",
-            priority: 1,
+            priority: 2,
             overrideAction: { none: {} },
             statement: {
               managedRuleGroupStatement: {
@@ -843,7 +869,7 @@ export class OodStack extends cdk.Stack {
           },
           {
             name: "KnownBadInputs",
-            priority: 2,
+            priority: 3,
             overrideAction: { none: {} },
             statement: {
               managedRuleGroupStatement: {
@@ -859,7 +885,7 @@ export class OodStack extends cdk.Stack {
           },
           {
             name: "SQLiProtection",
-            priority: 3,
+            priority: 4,
             overrideAction: { none: {} },
             statement: {
               managedRuleGroupStatement: {
@@ -894,6 +920,25 @@ export class OodStack extends cdk.Stack {
       this.node.tryGetContext("cloudfrontWafArn") || "";
 
     if (enableCdn && alb) {
+      // M1: S3 bucket for CloudFront access logs
+      const cdnLogBucket = new s3.Bucket(this, "CdnLogBucket", {
+        bucketName: undefined, // auto-generated
+        blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+        encryption: s3.BucketEncryption.S3_MANAGED,
+        enforceSSL: true,
+        objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_PREFERRED, // required for CF logging
+        lifecycleRules: [
+          {
+            id: "expire-cdn-logs",
+            enabled: true,
+            expiration: cdk.Duration.days(
+              props.environment === "prod" ? 365 : 90
+            ),
+          },
+        ],
+        removalPolicy: cdk.RemovalPolicy.RETAIN,
+      });
+
       // L1: security response headers policy — HSTS, X-Frame-Options, content-type nosniff
       const securityHeadersPolicy = new cloudfront.ResponseHeadersPolicy(
         this,
@@ -928,6 +973,9 @@ export class OodStack extends cdk.Stack {
       new cloudfront.Distribution(this, "Cdn", {
         comment: `OOD ${props.environment} CDN`,
         webAclId: cloudfrontWafArn || undefined,
+        logBucket: cdnLogBucket, // M1
+        logFilePrefix: "cdn-logs/",
+        logIncludesCookies: false,
         defaultBehavior: {
           origin: new cforigins.LoadBalancerV2Origin(alb, {
             protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
@@ -998,6 +1046,7 @@ export class OodStack extends cdk.Stack {
         comparisonOperator:
           cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
         alarmDescription: `OOD ${props.environment} CPU > threshold`,
+        treatMissingData: cloudwatch.TreatMissingData.BREACHING, // M7
       });
       cpuAlarm.addAlarmAction(
         new cloudwatchActions.SnsAction(alarmTopic)
@@ -1017,6 +1066,7 @@ export class OodStack extends cdk.Stack {
         comparisonOperator:
           cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
         alarmDescription: `OOD ${props.environment} instance status check`,
+        treatMissingData: cloudwatch.TreatMissingData.BREACHING, // M7
       });
       statusAlarm.addAlarmAction(
         new cloudwatchActions.SnsAction(alarmTopic)
@@ -1034,6 +1084,8 @@ export class OodStack extends cdk.Stack {
         ],
       });
 
+      // H4: explicit instance family list prevents Batch from selecting
+      // expensive families (x2iezn, z1d, etc.) when using "optimal"
       const computeEnv = new batch.ManagedEc2EcsComputeEnvironment(
         this,
         "BatchCompute",
@@ -1044,10 +1096,14 @@ export class OodStack extends cdk.Stack {
           spot: true,
           spotBidPercentage: 60,
           maxvCpus: 256,
-          instanceTypes: [ec2.InstanceType.of(
-            ec2.InstanceClass.M5,
-            ec2.InstanceSize.XLARGE
-          )],
+          instanceTypes: [
+            ec2.InstanceType.of(ec2.InstanceClass.M5, ec2.InstanceSize.XLARGE),
+            ec2.InstanceType.of(ec2.InstanceClass.M5, ec2.InstanceSize.XLARGE2),
+            ec2.InstanceType.of(ec2.InstanceClass.M5A, ec2.InstanceSize.XLARGE),
+            ec2.InstanceType.of(ec2.InstanceClass.M5A, ec2.InstanceSize.XLARGE2),
+            ec2.InstanceType.of(ec2.InstanceClass.M6I, ec2.InstanceSize.XLARGE),
+            ec2.InstanceType.of(ec2.InstanceClass.M6I, ec2.InstanceSize.XLARGE2),
+          ],
           serviceRole: batchServiceRole,
         }
       );
