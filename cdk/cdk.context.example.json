@@ -1,0 +1,32 @@
+{
+  "//": "Copy this file to cdk.context.json and fill in your values.",
+
+  "environment": "test",
+  "vpcId": "vpc-xxxxxxxxxxxxxxxxx",
+  "subnetId": "subnet-xxxxxxxxxxxxxxxxx",
+  "allowedCidr": "YOUR_IP/32",
+
+  "deploymentProfile": "minimal",
+  "domainName": "",
+
+  "useCognito": "true",
+  "enableEfs": "true",
+  "enableDynamodbUid": "true",
+  "enableSessionCache": "false",
+  "enableS3Browser": "false",
+
+  "enableAlb": "false",
+  "enableWaf": "false",
+  "enableVpcEndpoints": "false",
+  "enableCdn": "false",
+  "enableMonitoring": "false",
+  "enableComplianceLogging": "false",
+  "enableBackup": "false",
+  "enableKmsCmk": "false",
+  "enablePackerAmi": "false",
+  "enableParameterStore": "true",
+
+  "adaptersEnabled": [],
+
+  "alarmEmail": ""
+}
