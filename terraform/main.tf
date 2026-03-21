@@ -557,7 +557,8 @@ resource "aws_iam_role_policy" "ec2_adapter" {
         Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }
       },
       {
-        # RunInstances on images: restrict to AMIs tagged as OOD project
+        # RunInstances on images: restrict to AMIs tagged as OOD project AND owned by this account
+        # H4: without the owner check any AMI tagged Project=aws-openondemand in any account is usable
         Effect = "Allow"
         Action = ["ec2:RunInstances"]
         Resource = [
@@ -566,6 +567,7 @@ resource "aws_iam_role_policy" "ec2_adapter" {
         Condition = {
           StringEquals = {
             "ec2:ResourceTag/Project" = "aws-openondemand"
+            "ec2:Owner"               = data.aws_caller_identity.current.account_id
           }
         }
       },
@@ -815,10 +817,13 @@ resource "aws_elasticache_replication_group" "ood" {
 }
 
 resource "random_password" "redis_auth" {
-  count            = var.enable_session_cache ? 1 : 0
-  length           = 64 # Increased from 32; ElastiCache supports up to 128 chars (M3)
-  special          = true
-  override_special = "!@#%^&*()_+-=[]{}|:<>?,./"
+  count   = var.enable_session_cache ? 1 : 0
+  length  = 64 # ElastiCache supports up to 128 chars; 64 provides >380 bits of entropy
+  special = true
+  # M3: restrict to shell-safe special characters — exclude $ ` \ " ' ! * ? and others
+  # that cause interpolation issues in bash heredocs and shell parameter expansion.
+  # ElastiCache auth token allows printable ASCII 33–126 except space and @.
+  override_special = "#%&*-_+=:,./"
 }
 
 # ---------------------------------------------------------------------------
@@ -885,6 +890,28 @@ resource "aws_s3_bucket_ownership_controls" "ood_files_logs" {
   count  = var.enable_s3_browser ? 1 : 0
   bucket = aws_s3_bucket.ood_files_logs[0].id
   rule { object_ownership = "BucketOwnerPreferred" }
+}
+
+# H1: Encrypt the access-logs bucket — S3 server-access log delivery uses AES256 (SSE-KMS not supported)
+resource "aws_s3_bucket_server_side_encryption_configuration" "ood_files_logs" {
+  count  = var.enable_s3_browser ? 1 : 0
+  bucket = aws_s3_bucket.ood_files_logs[0].id
+  rule {
+    apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "ood_files_logs" {
+  count  = var.enable_s3_browser ? 1 : 0
+  bucket = aws_s3_bucket.ood_files_logs[0].id
+  rule {
+    id     = "expire-access-logs"
+    status = "Enabled"
+    filter {}
+    expiration {
+      days = var.environment == "prod" ? 365 : 90
+    }
+  }
 }
 
 resource "aws_s3_bucket_logging" "ood_files" {
@@ -1203,7 +1230,18 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "alb_logs" {
   count  = var.enable_alb ? 1 : 0
   bucket = aws_s3_bucket.alb_logs[0].id
   rule {
+    # H5: upgrade to CMK when available; ALB requires SSE-S3 (not SSE-KMS) for log delivery
+    # so we use AES256 here regardless — ALB logs are delivered by the ELB service account
+    # and SSE-KMS requires the ELB service to have kms:GenerateDataKey, which is not supported.
     apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
+  }
+}
+
+resource "aws_s3_bucket_versioning" "alb_logs" {
+  count  = var.enable_alb ? 1 : 0
+  bucket = aws_s3_bucket.alb_logs[0].id
+  versioning_configuration {
+    status = "Enabled" # H5: versioning detects log tampering
   }
 }
 
@@ -1548,6 +1586,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "cdn_logs" {
   count  = var.enable_cdn && var.enable_alb ? 1 : 0
   bucket = aws_s3_bucket.cdn_logs[0].id
   rule {
+    # M1: CloudFront log delivery uses the CloudFront service account — SSE-KMS is not supported,
+    # so AES256 is required regardless of CMK setting.
     apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
   }
 }
@@ -1676,9 +1716,10 @@ resource "aws_cloudwatch_log_group" "passenger" {
 }
 
 resource "aws_sns_topic" "ood" {
-  count             = var.enable_monitoring ? 1 : 0
-  name              = "ood-alarms-${var.environment}"
-  kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null # C1: encrypt SNS with CMK
+  count = var.enable_monitoring ? 1 : 0
+  name  = "ood-alarms-${var.environment}"
+  # C1: Always encrypt SNS — use CMK when available, fall back to AWS-managed SNS key (never unencrypted)
+  kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : "alias/aws/sns"
 }
 
 resource "aws_sns_topic_subscription" "email" {
@@ -1752,7 +1793,46 @@ resource "aws_cloudwatch_metric_alarm" "instance_status" {
   threshold           = 0
   alarm_description   = "OOD ${var.environment} instance status check failed"
   alarm_actions       = [aws_sns_topic.ood[0].arn]
-  treat_missing_data  = "breaching" # M7
+  treat_missing_data  = "breaching"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.ood.name
+  }
+}
+
+# M7: Disk and memory alarms using CWAgent custom metrics (CWAgent must be running on the instance)
+resource "aws_cloudwatch_metric_alarm" "disk_high" {
+  count               = var.enable_monitoring ? 1 : 0
+  alarm_name          = "ood-${var.environment}-disk-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "disk_used_percent"
+  namespace           = "CWAgent"
+  period              = 300
+  statistic           = "Average"
+  threshold           = var.environment == "prod" ? 80 : 90
+  alarm_description   = "OOD ${var.environment} root disk usage > threshold — portal may run out of space"
+  alarm_actions       = [aws_sns_topic.ood[0].arn]
+  treat_missing_data  = "breaching"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.ood.name
+    path                 = "/"
+    fstype               = "xfs"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "mem_high" {
+  count               = var.enable_monitoring ? 1 : 0
+  alarm_name          = "ood-${var.environment}-mem-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "mem_used_percent"
+  namespace           = "CWAgent"
+  period              = 300
+  statistic           = "Average"
+  threshold           = var.environment == "prod" ? 80 : 90
+  alarm_description   = "OOD ${var.environment} memory usage > threshold — Passenger workers may OOM"
+  alarm_actions       = [aws_sns_topic.ood[0].arn]
+  treat_missing_data  = "breaching"
   dimensions = {
     AutoScalingGroupName = aws_autoscaling_group.ood.name
   }
@@ -1846,6 +1926,44 @@ resource "aws_s3_bucket_lifecycle_configuration" "ssm_sessions" {
       days = var.environment == "prod" ? 365 : 90
     }
   }
+}
+
+# M6: Restrict SSM session transcript writes to the OOD instance role only.
+# This prevents other principals in the account from writing arbitrary data into the audit trail.
+resource "aws_s3_bucket_policy" "ssm_sessions" {
+  count  = var.enable_monitoring ? 1 : 0
+  bucket = aws_s3_bucket.ssm_sessions[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyNonInstanceWrites"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = ["s3:PutObject"]
+        Resource  = "${aws_s3_bucket.ssm_sessions[0].arn}/*"
+        Condition = {
+          ArnNotEquals = {
+            "aws:PrincipalArn" = [
+              aws_iam_role.ood.arn,
+              "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root",
+            ]
+          }
+        }
+      },
+      {
+        Sid       = "DenyHTTP"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.ssm_sessions[0].arn,
+          "${aws_s3_bucket.ssm_sessions[0].arn}/*",
+        ]
+        Condition = { Bool = { "aws:SecureTransport" = "false" } }
+      },
+    ]
+  })
 }
 
 resource "aws_ssm_document" "session_manager_prefs" {
@@ -2162,6 +2280,15 @@ resource "aws_cloudtrail" "ood" {
   tags = {
     Name = "ood-trail-${var.environment}"
   }
+
+  lifecycle {
+    # H3: multi-region trail is always enabled above; this precondition prevents future edits
+    # from silently disabling it and creating a gap in cross-region audit coverage.
+    precondition {
+      condition     = var.environment != "prod" || var.enable_compliance_logging
+      error_message = "enable_compliance_logging must be true for prod deployments."
+    }
+  }
 }
 
 resource "aws_s3_bucket" "cloudtrail" {
@@ -2270,6 +2397,15 @@ resource "aws_backup_vault" "ood" {
   kms_key_arn = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
 
   tags = { Name = "ood-backup-${var.environment}" }
+
+  lifecycle {
+    # M10: prod deployments require backups — EFS home dirs and DynamoDB UID map are irreplaceable.
+    # Set enable_backup=true in prod.tfvars to satisfy this precondition.
+    precondition {
+      condition     = var.environment != "prod" || var.enable_backup
+      error_message = "enable_backup must be true for prod deployments to protect EFS and DynamoDB data."
+    }
+  }
 }
 
 resource "aws_iam_role" "backup" {
@@ -2290,6 +2426,27 @@ resource "aws_iam_role_policy_attachment" "backup" {
   count      = var.enable_backup ? 1 : 0
   role       = aws_iam_role.backup[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup"
+}
+
+# M9: When CMK is enabled, AWS Backup needs explicit kms grants to encrypt/decrypt backup data.
+# The KMS key policy already has BackupEncryption statement; this inline policy lets the role use it.
+resource "aws_iam_role_policy" "backup_kms" {
+  count = var.enable_backup && var.enable_kms_cmk ? 1 : 0
+  name  = "backup-kms-access"
+  role  = aws_iam_role.backup[0].name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey",
+        "kms:CreateGrant",
+      ]
+      Resource = aws_kms_key.ood[0].arn
+    }]
+  })
 }
 
 resource "aws_backup_plan" "ood" {
@@ -2369,6 +2526,55 @@ resource "aws_kms_key" "ood" {
         Effect = "Allow"
         Principal = {
           AWS = aws_iam_role.ood.arn
+        }
+        Action = [
+          "kms:Decrypt",
+          "kms:GenerateDataKey",
+          "kms:DescribeKey",
+        ]
+        Resource = "*"
+      },
+      {
+        # M4: CloudWatch Logs service principal must be explicitly granted — without this,
+        # log group encryption silently fails even when kms_key_id is set on the log group.
+        Sid    = "CloudWatchLogsEncryption"
+        Effect = "Allow"
+        Principal = {
+          Service = "logs.${var.aws_region}.amazonaws.com"
+        }
+        Action = [
+          "kms:Encrypt*",
+          "kms:Decrypt*",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:Describe*",
+        ]
+        Resource = "*"
+        Condition = {
+          ArnLike = {
+            "kms:EncryptionContext:aws:logs:arn" = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:*"
+          }
+        }
+      },
+      {
+        # SNS service principal required for encrypted SNS topics
+        Sid    = "SNSEncryption"
+        Effect = "Allow"
+        Principal = {
+          Service = "sns.amazonaws.com"
+        }
+        Action = [
+          "kms:GenerateDataKey*",
+          "kms:Decrypt",
+        ]
+        Resource = "*"
+      },
+      {
+        # Backup service principal required when enable_backup=true and enable_kms_cmk=true
+        Sid    = "BackupEncryption"
+        Effect = "Allow"
+        Principal = {
+          Service = "backup.amazonaws.com"
         }
         Action = [
           "kms:Decrypt",

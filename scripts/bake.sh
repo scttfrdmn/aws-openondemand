@@ -53,7 +53,10 @@ dnf -y install --setopt=gpgcheck=1 "${ONDEMAND_RELEASE_URL}" || {
   exit 1
 }
 
-dnf -y install ondemand-4.0.10
+# I5: Pin OOD version via env var for reproducible builds. Override at bake time:
+#     packer build -var ood_version=4.1.0 (or set OOD_VERSION env var)
+OOD_VERSION="${OOD_VERSION:-4.0.10}"
+dnf -y install "ondemand-${OOD_VERSION}"
 
 # Enable OOD services (OOD 4.x on AL2023 uses httpd.service with drop-in configs)
 systemctl enable httpd || true
@@ -128,6 +131,17 @@ if curl -fsSL --head "${OIDC_PAM_TGZ_URL}" 2>/dev/null | grep -q "200\|302"; the
     echo "ERROR: oidc-pam binary failed smoke test — binary may be corrupted"
     exit 1
   fi
+  # L4: verify PAM and NSS modules were extracted — these are the runtime-critical files.
+  # The binary smoke-test above only checks the CLI; pam_oidc.so and nss_oidc.so are separate.
+  for module_path in \
+    /usr/lib64/security/pam_oidc.so \
+    /usr/lib64/libnss_oidc.so.2; do
+    if [ ! -f "${module_path}" ]; then
+      echo "WARNING: Expected module not found: ${module_path}"
+      echo "         oidc-pam release may not include this file for ${OIDC_PAM_ARCH}."
+      echo "         PAM/NSS integration may not function at runtime — verify manually."
+    fi
+  done
   echo "=== oidc-pam ${OIDC_PAM_VERSION} installed ==="
 else
   echo "ERROR: oidc-pam binary not available at ${OIDC_PAM_TGZ_URL} — aborting AMI build (L1)"

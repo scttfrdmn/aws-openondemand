@@ -186,6 +186,30 @@ export class OodStack extends cdk.Stack {
         aliasName: `alias/ood-${props.environment}`,
         targetKey: cmk,
       });
+      // L7: CloudWatch Logs requires an explicit key policy grant to encrypt log groups.
+      // Without this, log groups with kms_key_id set silently fall back to unencrypted storage.
+      cmk.addToResourcePolicy(
+        new iam.PolicyStatement({
+          principals: [
+            new iam.ServicePrincipal(
+              `logs.${this.region}.amazonaws.com`
+            ),
+          ],
+          actions: [
+            "kms:Encrypt*",
+            "kms:Decrypt*",
+            "kms:ReEncrypt*",
+            "kms:GenerateDataKey*",
+            "kms:Describe*",
+          ],
+          resources: ["*"],
+          conditions: {
+            ArnLike: {
+              "kms:EncryptionContext:aws:logs:arn": `arn:aws:logs:${this.region}:${this.account}:*`,
+            },
+          },
+        })
+      );
     }
 
     // --- Security Groups ---
@@ -271,6 +295,10 @@ export class OodStack extends cdk.Stack {
             domainName !== "" ? `https://${domainName}` : "https://localhost",
           ],
         },
+        // M8: Both userPassword and userSrp are intentionally disabled.
+        // OOD uses OIDC/OAuth2 via the ALB authenticator — users never authenticate
+        // directly against Cognito's native auth endpoints. Disabling these flows
+        // prevents credential stuffing attacks against the Cognito hosted UI endpoints.
         authFlows: { userPassword: false, userSrp: false },
         preventUserExistenceErrors: true,
       });
@@ -643,7 +671,9 @@ export class OodStack extends cdk.Stack {
       `export OOD_ADAPTERS_ENABLED='${JSON.stringify(adaptersEnabled)}'`,
       `export OOD_LOG_GROUP_PREFIX="${logGroupPrefix}"`,
       // H3: download-then-verify-then-run instead of curl|bash to prevent
-      // truncated-download execution and enable SHA verification
+      // truncated-download execution and enable SHA verification.
+      // L1: when enablePackerAmi=true, scriptsBranch is only used for userdata.sh (not bake.sh).
+      // The bake.sh was already applied at AMI build time from the commit SHA recorded in the AMI tags.
       ...(enablePackerAmi
         ? ["# Baked AMI — bake.sh already applied at image build time"]
         : [
@@ -1154,7 +1184,9 @@ export class OodStack extends cdk.Stack {
       );
       smRole.addToPrincipalPolicy(
         new iam.PolicyStatement({
-          actions: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+          // H2: DeleteObject omitted — SageMaker jobs should not delete input/output data.
+          // Lifecycle management is handled by the SageMaker domain admin, not notebook code.
+          actions: ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
           resources: [
             `arn:aws:s3:::sagemaker-${this.region}-${this.account}`,
             `arn:aws:s3:::sagemaker-${this.region}-${this.account}/*`,

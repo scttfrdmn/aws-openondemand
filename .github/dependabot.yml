@@ -1,0 +1,36 @@
+version: 2
+updates:
+  # L8: Automated GitHub Actions version updates.
+  # All actions in ci.yml are SHA-pinned (L1 supply chain control); Dependabot will open PRs
+  # to update the SHA pins to newer versions, keeping the review burden manageable.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "security"
+    # Group all action updates into a single PR to reduce noise
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # CDK and other npm dependencies
+  - package-ecosystem: "npm"
+    directory: "/cdk"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+    groups:
+      cdk-deps:
+        patterns:
+          - "aws-cdk*"
+          - "@aws-cdk/*"

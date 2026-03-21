@@ -17,7 +17,7 @@ echo "=== OOD bootstrap started at $(date) ==="
 # IMDSv2 token-based metadata retrieval
 ###############################################################################
 IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
-  -H "X-aws-ec2-metadata-token-ttl-seconds: 900") # L2: 900s covers full bootstrap duration
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 1800") # L2: 1800s covers full bootstrap including slow EFS/FSx mounts
 imds_get() {
   curl -s -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
     "http://169.254.169.254/latest/meta-data/$1"
@@ -77,10 +77,14 @@ if [ -n "${OOD_OIDC_CLIENT_SECRET_ARN}" ]; then
     --query 'SecretString' \
     --output text 2>"${SM_ERROR_LOG}" || echo "")
   if [ -z "${OOD_OIDC_CLIENT_SECRET}" ]; then
-    echo "WARNING: Failed to retrieve OIDC client secret from Secrets Manager"
+    # L3: OIDC secret is required for portal authentication — abort if retrieval fails.
+    # A missing secret would launch a portal that silently rejects all logins.
+    echo "FATAL: Failed to retrieve OIDC client secret from Secrets Manager"
     echo "  Secret ARN: ${OOD_OIDC_CLIENT_SECRET_ARN}"
     echo "  AWS error: $(cat "${SM_ERROR_LOG}")"
     echo "  Check: IAM role has secretsmanager:GetSecretValue on this ARN"
+    rm -f "${SM_ERROR_LOG}"
+    exit 1
   else
     echo "=== OIDC client secret retrieved from Secrets Manager ==="
   fi

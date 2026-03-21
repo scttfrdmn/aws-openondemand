@@ -25,9 +25,12 @@ variable "subnet_id" {
 variable "git_sha" {
   type    = string
   default = ""
-  # L5: emit a warning at build time if git_sha is not provided —
-  # AMIs without provenance cannot be traced back to a source commit.
-  # Pass -var git_sha=$(git rev-parse HEAD) in CI/bake pipelines.
+  # L5: enforce a full 40-char hex SHA — partial SHAs and branch names are not acceptable
+  # for AMI provenance. Pass -var git_sha=$(git rev-parse HEAD) in CI/bake pipelines.
+  validation {
+    condition     = var.git_sha == "" || can(regex("^[a-f0-9]{40}$", var.git_sha))
+    error_message = "The git_sha variable must be a full 40-character lowercase hex SHA-1 commit hash (the output of: git rev-parse HEAD)."
+  }
 }
 
 # AL2023 base AMI (Amazon-owned, x86_64)
