@@ -335,6 +335,11 @@ export class OodStack extends cdk.Stack {
         "NFS to EFS"
       );
 
+      // M2: The access point runs as uid/gid 0 (root) with permissions 755.
+      // This is intentional: OOD's PAM module (oidc-pam) must create per-user
+      // home directories under /home on first login, which requires root.
+      // User-level isolation is enforced by PAM session configuration and
+      // OOD's per-user Nginx/Passenger processes (PUN), not by EFS permissions.
       homeAccessPoint = new efs.AccessPoint(this, "HomeAccessPoint", {
         fileSystem: homeFs,
         posixUser: { uid: "0", gid: "0" },
@@ -592,8 +597,18 @@ export class OodStack extends cdk.Stack {
 
     // --- User Data ---
     const userData = ec2.UserData.forLinux();
+    // C1: Pin to a commit SHA for production deployments to prevent supply chain attacks.
+    // Usage: cdk deploy -c scriptsBranch=<40-char-sha>
+    // Using "main" is acceptable for development but MUST NOT be used in prod.
     const scriptsBranch =
       this.node.tryGetContext("scriptsBranch") || "main";
+    const isSha = /^[a-f0-9]{40}$/.test(scriptsBranch);
+    if (!isSha && props.environment !== "test") {
+      throw new Error(
+        `scriptsBranch must be a full commit SHA (40 hex chars) for ${props.environment} deployments. ` +
+          `Got: "${scriptsBranch}". Using a mutable branch ref is a supply chain risk.`
+      );
+    }
     const baseUrl = `https://raw.githubusercontent.com/scttfrdmn/aws-openondemand/${scriptsBranch}/scripts`;
 
     userData.addCommands(

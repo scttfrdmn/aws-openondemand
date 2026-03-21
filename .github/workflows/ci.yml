@@ -57,9 +57,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: hashicorp/setup-packer@main
+      - uses: hashicorp/setup-packer@v3 # Pinned to stable release tag (H1)
         with:
-          version: latest
+          version: "1.11.2" # Pin to specific version for reproducible AMI builds
 
       - name: Init Packer plugins
         run: packer init packer/ood.pkr.hcl
@@ -85,7 +85,8 @@ jobs:
           directory: terraform
           framework: terraform
           soft_fail: false
-          skip_check: CKV_AWS_79  # IMDSv2 enforced via launch template, not checkov-visible
+          # Suppressions are documented in .checkov.yaml at repo root (H6)
+          config_file: .checkov.yaml
 
       - name: trivy (secret scan)
         uses: aquasecurity/trivy-action@master

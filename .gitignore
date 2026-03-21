@@ -20,6 +20,7 @@ cdk/cdk.context.json
 *.tfplan
 terraform/.terraform.lock.hcl
 terraform/terraform.tfvars
+terraform/backend.hcl  # Contains account-specific backend config — never commit
 
 # Secrets / credentials
 *.pem

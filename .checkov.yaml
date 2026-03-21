@@ -1,0 +1,15 @@
+# .checkov.yaml — Checkov suppression configuration
+#
+# Each entry documents WHY the check is suppressed and where the control
+# is actually enforced. Review these before each Checkov version upgrade
+# to confirm suppressions are still valid.
+#
+# Last reviewed: 2026-03-20
+
+skip-check:
+  # CKV_AWS_79: Ensure Instance Metadata Service Version 1 is not enabled
+  # Suppression reason: IMDSv2 is enforced in aws_launch_template.ood via
+  #   metadata_options { http_tokens = "required" }  (terraform/main.tf ~L905)
+  # Checkov's static analyzer cannot detect metadata_options nested inside
+  # a dynamic launch template block. Verified manually and in deploy tests.
+  - CKV_AWS_79

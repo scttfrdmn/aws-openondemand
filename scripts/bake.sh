@@ -126,8 +126,9 @@ if curl -fsSL --head "${OIDC_PAM_TGZ_URL}" 2>/dev/null | grep -q "200\|302"; the
   fi
   echo "=== oidc-pam ${OIDC_PAM_VERSION} installed ==="
 else
-  echo "WARNING: oidc-pam binary not available at ${OIDC_PAM_TGZ_URL} — skipping"
-  echo "         Install manually when binaries are published"
+  echo "ERROR: oidc-pam binary not available at ${OIDC_PAM_TGZ_URL} — aborting AMI build (L1)"
+  echo "       Set OIDC_PAM_VERSION to a published release tag and retry."
+  exit 1
 fi
 
 # Create oidc-auth-broker config directory (populated at launch by userdata.sh)

@@ -48,9 +48,9 @@ if [ "${OOD_ENABLE_PARAMETER_STORE}" = "true" ]; then
               efs_id)                OOD_EFS_ID="${value}" ;;
               efs_access_point_id)   OOD_EFS_ACCESS_POINT_ID="${value}" ;;
               dynamodb_uid_table)    OOD_DYNAMODB_UID_TABLE="${value}" ;;
-              oidc_client_id)        OOD_OIDC_CLIENT_ID="${value}" ;;
-              oidc_client_secret)    OOD_OIDC_CLIENT_SECRET="${value}" ;;
-              oidc_issuer_url)       OOD_OIDC_ISSUER_URL="${value}" ;;
+              oidc_client_id)         OOD_OIDC_CLIENT_ID="${value}" ;;
+              oidc_client_secret_arn) OOD_OIDC_CLIENT_SECRET_ARN="${value}" ;; # H2: ARN pointer only
+              oidc_issuer_url)        OOD_OIDC_ISSUER_URL="${value}" ;;
               redis_endpoint)        OOD_REDIS_ENDPOINT="${value}" ;;
           esac
       done; then
@@ -63,8 +63,23 @@ fi
 # Fallback defaults for SSM-sourced vars
 OOD_DYNAMODB_UID_TABLE="${OOD_DYNAMODB_UID_TABLE:-}"
 OOD_OIDC_CLIENT_ID="${OOD_OIDC_CLIENT_ID:-}"
-OOD_OIDC_CLIENT_SECRET="${OOD_OIDC_CLIENT_SECRET:-}"
+OOD_OIDC_CLIENT_SECRET_ARN="${OOD_OIDC_CLIENT_SECRET_ARN:-}"
 OOD_OIDC_ISSUER_URL="${OOD_OIDC_ISSUER_URL:-}"
+
+# Fetch OIDC client secret from Secrets Manager (never stored in SSM or userdata) (H2)
+OOD_OIDC_CLIENT_SECRET=""
+if [ -n "${OOD_OIDC_CLIENT_SECRET_ARN}" ]; then
+  OOD_OIDC_CLIENT_SECRET=$(aws secretsmanager get-secret-value \
+    --region "${AWS_REGION}" \
+    --secret-id "${OOD_OIDC_CLIENT_SECRET_ARN}" \
+    --query 'SecretString' \
+    --output text 2>/dev/null || echo "")
+  if [ -z "${OOD_OIDC_CLIENT_SECRET}" ]; then
+    echo "WARNING: Failed to retrieve OIDC client secret from Secrets Manager"
+  else
+    echo "=== OIDC client secret retrieved from Secrets Manager ==="
+  fi
+fi
 OOD_REDIS_ENDPOINT="${OOD_REDIS_ENDPOINT:-}"
 
 ###############################################################################

@@ -5,13 +5,11 @@ terraform {
     random = { source = "hashicorp/random", version = "~> 3.0" }
   }
 
-  backend "s3" {
-    bucket         = "ood-terraform-state"
-    key            = "ood/terraform.tfstate"
-    region         = "us-east-1"
-    encrypt        = true
-    dynamodb_table = "ood-terraform-locks"
-  }
+  # Backend config intentionally not hardcoded — provide via -backend-config (C2).
+  # Copy terraform/backend.hcl.example → terraform/backend.hcl, fill in values, then:
+  #   terraform init -backend-config=backend.hcl
+  # backend.hcl is gitignored. Hardcoding causes state collisions across accounts/envs.
+  backend "s3" {}
 }
 
 provider "aws" {
@@ -208,8 +206,11 @@ resource "aws_security_group" "alb" {
     protocol    = "tcp"
     cidr_blocks = [var.allowed_cidr]
   }
+  # C3: ALB terminates TLS and forwards HTTP to the EC2 instance over a private VPC
+  # connection. This is intentional — OOD runs Apache on port 80 behind the ALB.
+  # HTTPS egress (443) is not needed because the ALB→EC2 path never uses TLS.
   egress {
-    description     = "HTTP to EC2"
+    description     = "HTTP to EC2 (intentional: ALB terminates TLS, forwards plaintext on private VPC)"
     from_port       = 80
     to_port         = 80
     protocol        = "tcp"
@@ -359,6 +360,21 @@ resource "aws_iam_role_policy" "ssm_params" {
         "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/ood/${var.environment}",
         "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/ood/${var.environment}/*"
       ]
+    }]
+  })
+}
+
+# Secrets Manager: fetch OIDC client secret at runtime (H2)
+resource "aws_iam_role_policy" "secrets_manager" {
+  count       = var.use_cognito ? 1 : 0
+  name_prefix = "ood-secrets-manager-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = aws_secretsmanager_secret.oidc_client_secret[0].arn
     }]
   })
 }
@@ -744,9 +760,10 @@ resource "aws_elasticache_replication_group" "ood" {
 }
 
 resource "random_password" "redis_auth" {
-  count   = var.enable_session_cache ? 1 : 0
-  length  = 32
-  special = false
+  count            = var.enable_session_cache ? 1 : 0
+  length           = 64 # Increased from 32; ElastiCache supports up to 128 chars (M3)
+  special          = true
+  override_special = "!@#%^&*()_+-=[]{}|:<>?,./"
 }
 
 # ---------------------------------------------------------------------------
@@ -849,11 +866,30 @@ resource "aws_ssm_parameter" "oidc_client_id" {
   value = var.use_cognito ? aws_cognito_user_pool_client.ood[0].id : var.oidc_client_id
 }
 
-resource "aws_ssm_parameter" "oidc_client_secret" {
+# OIDC client secret stored in Secrets Manager — NOT SSM — to reduce blast radius (H2).
+# The secret ARN is stored in SSM as a non-sensitive pointer; userdata.sh fetches
+# the secret value at runtime via secretsmanager:GetSecretValue.
+resource "aws_secretsmanager_secret" "oidc_client_secret" {
+  count                   = var.use_cognito ? 1 : 0
+  name                    = "ood/${var.environment}/oidc-client-secret"
+  recovery_window_in_days = var.environment == "prod" ? 30 : 7
+  kms_key_id              = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+
+  tags = { Name = "ood-oidc-secret-${var.environment}" }
+}
+
+resource "aws_secretsmanager_secret_version" "oidc_client_secret" {
+  count         = var.use_cognito ? 1 : 0
+  secret_id     = aws_secretsmanager_secret.oidc_client_secret[0].id
+  secret_string = aws_cognito_user_pool_client.ood[0].client_secret
+}
+
+# SSM pointer to the Secrets Manager ARN (non-sensitive — just a name/ARN)
+resource "aws_ssm_parameter" "oidc_client_secret_arn" {
   count = var.enable_parameter_store && var.use_cognito ? 1 : 0
-  name  = "/ood/${var.environment}/oidc_client_secret"
-  type  = "SecureString"
-  value = var.use_cognito ? aws_cognito_user_pool_client.ood[0].client_secret : "placeholder"
+  name  = "/ood/${var.environment}/oidc_client_secret_arn"
+  type  = "String"
+  value = aws_secretsmanager_secret.oidc_client_secret[0].arn
 }
 
 resource "aws_ssm_parameter" "oidc_issuer_url" {
@@ -1081,6 +1117,19 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "alb_logs" {
   bucket = aws_s3_bucket.alb_logs[0].id
   rule {
     apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "alb_logs" {
+  count  = var.enable_alb ? 1 : 0
+  bucket = aws_s3_bucket.alb_logs[0].id
+  rule {
+    id     = "expire-alb-logs"
+    status = "Enabled"
+    filter {}
+    expiration {
+      days = var.environment == "prod" ? 365 : 90 # L4: prevent unbounded growth
+    }
   }
 }
 
@@ -1446,24 +1495,28 @@ resource "aws_cloudwatch_log_group" "bootstrap" {
   count             = var.enable_monitoring ? 1 : 0
   name              = "/aws/ec2/ood-${var.environment}/bootstrap"
   retention_in_days = local.log_retention
+  kms_key_id        = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null # M4
 }
 
 resource "aws_cloudwatch_log_group" "nginx_access" {
   count             = var.enable_monitoring ? 1 : 0
   name              = "/aws/ec2/ood-${var.environment}/nginx-access"
   retention_in_days = local.log_retention
+  kms_key_id        = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null # M4
 }
 
 resource "aws_cloudwatch_log_group" "nginx_error" {
   count             = var.enable_monitoring ? 1 : 0
   name              = "/aws/ec2/ood-${var.environment}/nginx-error"
   retention_in_days = local.log_retention
+  kms_key_id        = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null # M4
 }
 
 resource "aws_cloudwatch_log_group" "passenger" {
   count             = var.enable_monitoring ? 1 : 0
   name              = "/aws/ec2/ood-${var.environment}/passenger"
   retention_in_days = local.log_retention
+  kms_key_id        = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null # M4
 }
 
 resource "aws_sns_topic" "ood" {
@@ -1752,6 +1805,54 @@ resource "aws_flow_log" "ood" {
   vpc_id          = data.aws_vpc.selected.id
 }
 
+# S3 flow log destination for long-term retention and Athena queries (H5)
+resource "aws_s3_bucket" "flow_logs" {
+  count         = var.enable_compliance_logging ? 1 : 0
+  bucket_prefix = "ood-flow-logs-${var.environment}-"
+  tags          = { Name = "ood-flow-logs-${var.environment}" }
+}
+
+resource "aws_s3_bucket_public_access_block" "flow_logs" {
+  count                   = var.enable_compliance_logging ? 1 : 0
+  bucket                  = aws_s3_bucket.flow_logs[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "flow_logs" {
+  count  = var.enable_compliance_logging ? 1 : 0
+  bucket = aws_s3_bucket.flow_logs[0].id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = var.enable_kms_cmk ? "aws:kms" : "AES256"
+      kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "flow_logs" {
+  count  = var.enable_compliance_logging ? 1 : 0
+  bucket = aws_s3_bucket.flow_logs[0].id
+  rule {
+    id     = "expire-flow-logs"
+    status = "Enabled"
+    filter {}
+    expiration {
+      days = var.environment == "prod" ? 365 : 90
+    }
+  }
+}
+
+resource "aws_flow_log" "ood_s3" {
+  count                = var.enable_compliance_logging ? 1 : 0
+  log_destination      = "${aws_s3_bucket.flow_logs[0].arn}/vpc-flow-logs/"
+  log_destination_type = "s3"
+  traffic_type         = "ALL"
+  vpc_id               = data.aws_vpc.selected.id
+}
+
 resource "aws_cloudwatch_log_group" "flow_log" {
   count             = var.enable_compliance_logging ? 1 : 0
   name              = "/aws/vpc/ood-${var.environment}/flow-logs"
@@ -1802,8 +1903,19 @@ resource "aws_cloudtrail" "ood" {
   name                          = "ood-${var.environment}"
   s3_bucket_name                = aws_s3_bucket.cloudtrail[0].id
   include_global_service_events = true
-  is_multi_region_trail         = var.environment == "prod"
+  is_multi_region_trail         = true # Always multi-region — cross-region calls invisible otherwise (H3)
   enable_log_file_validation    = true
+
+  # Data events: audit S3 object access and Lambda invocations (H4)
+  event_selector {
+    read_write_type           = "All"
+    include_management_events = true
+
+    data_resource {
+      type   = "AWS::S3::Object"
+      values = ["arn:aws:s3:::"] # All S3 objects — narrow to specific buckets if cost is a concern
+    }
+  }
 
   tags = {
     Name = "ood-trail-${var.environment}"
