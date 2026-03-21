@@ -76,15 +76,14 @@ chmod 755 /var/log/ood
 # Download the latest release binary from github.com/scttfrdmn/oidc-pam
 # Pin to a specific release tag for reproducible AMI builds.
 # Override at packer build time: packer build -var oidc_pam_version=v1.2.3
-OIDC_PAM_VERSION="${OIDC_PAM_VERSION:-}"
-if [ -z "${OIDC_PAM_VERSION}" ]; then
-  OIDC_PAM_VERSION=$(curl -fsSL \
-    https://api.github.com/repos/scttfrdmn/oidc-pam/releases/latest \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null \
-    || echo "")
-fi
-if [ -z "${OIDC_PAM_VERSION}" ]; then
-  echo "ERROR: Cannot determine oidc-pam version — set OIDC_PAM_VERSION env var or ensure GitHub API is reachable"
+# L3: OIDC_PAM_VERSION must be set explicitly — auto-detecting the "latest" release at bake
+# time produces non-reproducible AMIs (two runs from the same commit may install different
+# binaries). Pin to a specific tag in CI or the Packer variable file.
+if [ -z "${OIDC_PAM_VERSION:-}" ]; then
+  echo "ERROR: OIDC_PAM_VERSION is not set."
+  echo "       Pin to a specific release tag for reproducible AMI builds:"
+  echo "         packer build -var oidc_pam_version=v1.2.3 packer/ood.pkr.hcl"
+  echo "       or set the environment variable before running this script."
   exit 1
 fi
 
@@ -131,17 +130,24 @@ if curl -fsSL --head "${OIDC_PAM_TGZ_URL}" 2>/dev/null | grep -q "200\|302"; the
     echo "ERROR: oidc-pam binary failed smoke test — binary may be corrupted"
     exit 1
   fi
-  # L4: verify PAM and NSS modules were extracted — these are the runtime-critical files.
-  # The binary smoke-test above only checks the CLI; pam_oidc.so and nss_oidc.so are separate.
+  # L2: verify PAM and NSS modules were extracted — these are the runtime-critical files.
+  # The binary smoke-test above only checks the CLI; pam_oidc.so and nss_oidc.so are what
+  # actually perform authentication at runtime. A baked AMI without these is silently broken.
+  PAM_MODULE_MISSING=0
   for module_path in \
     /usr/lib64/security/pam_oidc.so \
     /usr/lib64/libnss_oidc.so.2; do
     if [ ! -f "${module_path}" ]; then
-      echo "WARNING: Expected module not found: ${module_path}"
-      echo "         oidc-pam release may not include this file for ${OIDC_PAM_ARCH}."
-      echo "         PAM/NSS integration may not function at runtime — verify manually."
+      echo "ERROR: Required module not found: ${module_path}"
+      PAM_MODULE_MISSING=1
     fi
   done
+  if [ "${PAM_MODULE_MISSING}" -eq 1 ]; then
+    echo "FATAL: One or more oidc-pam PAM/NSS modules are missing after extraction."
+    echo "       Aborting AMI bake — a portal without these modules will silently reject all logins."
+    echo "       Check that oidc-pam ${OIDC_PAM_VERSION} ships PAM/NSS modules for ${OIDC_PAM_ARCH}."
+    exit 1
+  fi
   echo "=== oidc-pam ${OIDC_PAM_VERSION} installed ==="
 else
   echo "ERROR: oidc-pam binary not available at ${OIDC_PAM_TGZ_URL} — aborting AMI build (L1)"

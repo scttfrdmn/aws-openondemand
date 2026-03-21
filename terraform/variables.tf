@@ -28,6 +28,16 @@ variable "private_subnet_ids" {
   description = "Private subnet IDs for EFS mount targets, ElastiCache, and other private resources (defaults to [subnet_id] when empty)"
 }
 
+variable "alb_subnet_ids" {
+  type        = list(string)
+  default     = []
+  description = <<-EOT
+    Subnet IDs for the ALB (must be in different AZs for high availability).
+    Defaults to [subnet_id] when empty, but that produces a single-AZ ALB.
+    For staging and prod, provide at least 2 subnets in different AZs.
+  EOT
+}
+
 variable "allowed_cidr" {
   type        = string
   description = "CIDR for inbound HTTP/HTTPS — do NOT use 0.0.0.0/0 in staging/prod"

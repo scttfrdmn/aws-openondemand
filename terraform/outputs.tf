@@ -106,3 +106,11 @@ output "kms_key_arn" {
   value       = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : ""
   sensitive   = true # M7
 }
+
+output "oidc_client_secret_arn" {
+  description = "Secrets Manager ARN holding the Cognito OIDC client secret (empty if Cognito disabled)"
+  # L4: mark sensitive — the ARN itself is not a secret but knowing it enables targeted
+  # GetSecretValue attempts and is a privilege escalation stepping stone.
+  value     = var.use_cognito ? aws_secretsmanager_secret.oidc_client_secret[0].arn : ""
+  sensitive = true
+}

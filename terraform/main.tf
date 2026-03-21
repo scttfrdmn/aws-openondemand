@@ -58,6 +58,10 @@ locals {
   # Effective private subnets for EFS/ElastiCache/etc.
   private_subnets = length(var.private_subnet_ids) > 0 ? var.private_subnet_ids : [var.subnet_id]
 
+  # C1: ALB subnets — operator should provide at least 2 subnets in different AZs for prod/staging.
+  # If alb_subnet_ids is empty, fall back to a single subnet (acceptable only for test).
+  alb_subnets = length(var.alb_subnet_ids) > 0 ? var.alb_subnet_ids : [var.subnet_id]
+
   # Adapter flags
   enable_batch       = contains(var.adapters_enabled, "batch")
   enable_sagemaker   = contains(var.adapters_enabled, "sagemaker")
@@ -557,8 +561,10 @@ resource "aws_iam_role_policy" "ec2_adapter" {
         Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }
       },
       {
-        # RunInstances on images: restrict to AMIs tagged as OOD project AND owned by this account
-        # H4: without the owner check any AMI tagged Project=aws-openondemand in any account is usable
+        # RunInstances on images: restrict to AMIs tagged as OOD project AND owned by this account.
+        # H3: ec2:Owner matches the account ID that CREATED the AMI — a cross-account shared AMI
+        # would fail this check even if tagged Project=aws-openondemand, because the owner is the
+        # source account, not this account. This is the authoritative control for AMI origin.
         Effect = "Allow"
         Action = ["ec2:RunInstances"]
         Resource = [
@@ -935,6 +941,44 @@ resource "aws_s3_bucket_lifecycle_configuration" "ood_files" {
   }
 }
 
+# H1: Deny unencrypted uploads and non-TLS access to the OOD file browser bucket.
+# SSE is configured as the default, but without this policy a client can explicitly
+# override encryption or use HTTP, bypassing both controls.
+resource "aws_s3_bucket_policy" "ood_files" {
+  count  = var.enable_s3_browser ? 1 : 0
+  bucket = aws_s3_bucket.ood_files[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyHTTP"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.ood_files[0].arn,
+          "${aws_s3_bucket.ood_files[0].arn}/*",
+        ]
+        Condition = { Bool = { "aws:SecureTransport" = "false" } }
+      },
+      {
+        # Deny uploads that explicitly opt out of server-side encryption.
+        # Applies to all callers — the OOD app must not set x-amz-server-side-encryption: none.
+        Sid       = "DenyUnencryptedUploads"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.ood_files[0].arn}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-server-side-encryption" = "false"
+          }
+        }
+      },
+    ]
+  })
+}
+
 # ---------------------------------------------------------------------------
 # SSM Parameter Store — runtime config for userdata.sh
 # ---------------------------------------------------------------------------
@@ -980,6 +1024,17 @@ resource "aws_secretsmanager_secret_rotation" "oidc_client_secret" {
 
   rotation_rules {
     automatically_after_days = 90
+  }
+
+  lifecycle {
+    # H2: prod deployments must have automatic rotation — manual rotation is error-prone
+    # and a missed rotation causes all user logins to fail for the full rotation window.
+    # Build a rotation Lambda and set oidc_secret_rotation_lambda_arn in prod.tfvars.
+    # See docs/identity-guide.md for the rotation Lambda implementation.
+    precondition {
+      condition     = var.environment != "prod" || var.oidc_secret_rotation_lambda_arn != ""
+      error_message = "Production deployments require oidc_secret_rotation_lambda_arn to enable automatic OIDC secret rotation. Manual rotation every 90 days is not acceptable for prod."
+    }
   }
 }
 
@@ -1263,12 +1318,38 @@ resource "aws_s3_bucket_policy" "alb_logs" {
   bucket = aws_s3_bucket.alb_logs[0].id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { AWS = data.aws_elb_service_account.main.arn }
-      Action    = "s3:PutObject"
-      Resource  = "${aws_s3_bucket.alb_logs[0].arn}/alb-logs/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
-    }]
+    Statement = [
+      {
+        Sid       = "AllowELBLogs"
+        Effect    = "Allow"
+        Principal = { AWS = data.aws_elb_service_account.main.arn }
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.alb_logs[0].arn}/alb-logs/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
+      },
+      {
+        # H4: Prevent any principal (including account root) from disabling versioning.
+        # Versioning must remain enabled to detect log deletion or tampering.
+        Sid       = "DenyVersioningDisable"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutBucketVersioning"
+        Resource  = aws_s3_bucket.alb_logs[0].arn
+        Condition = {
+          StringEquals = { "s3:VersionStatus" = "Suspended" }
+        }
+      },
+      {
+        Sid       = "DenyHTTP"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.alb_logs[0].arn,
+          "${aws_s3_bucket.alb_logs[0].arn}/*",
+        ]
+        Condition = { Bool = { "aws:SecureTransport" = "false" } }
+      },
+    ]
   })
 }
 
@@ -1281,7 +1362,7 @@ resource "aws_lb" "ood" {
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb[0].id]
-  subnets            = [var.subnet_id]
+  subnets            = local.alb_subnets
 
   enable_deletion_protection = var.environment != "test"
 
@@ -1296,6 +1377,15 @@ resource "aws_lb" "ood" {
   }
 
   depends_on = [aws_s3_bucket_policy.alb_logs]
+
+  lifecycle {
+    # C1: staging and prod require multi-AZ ALB subnets to survive an AZ outage.
+    # Set alb_subnet_ids to subnets in at least 2 different AZs in staging/prod.tfvars.
+    precondition {
+      condition     = var.environment == "test" || length(local.alb_subnets) >= 2
+      error_message = "ALB requires at least 2 subnets in different AZs for staging and prod deployments. Set alb_subnet_ids in your tfvars."
+    }
+  }
 }
 
 resource "aws_lb_target_group" "ood" {
@@ -1732,12 +1822,33 @@ resource "aws_sns_topic_subscription" "email" {
 # L7: SQS dead-letter queue captures alarm notifications if delivery fails.
 # Alarms published to SNS are also forwarded here, so they are never silently lost.
 resource "aws_sqs_queue" "alarm_dlq" {
-  count                     = var.enable_monitoring ? 1 : 0
-  name                      = "ood-alarm-dlq-${var.environment}"
-  message_retention_seconds = 1209600 # 14 days
-  kms_master_key_id         = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+  count                      = var.enable_monitoring ? 1 : 0
+  name                       = "ood-alarm-dlq-${var.environment}"
+  message_retention_seconds  = 1209600 # 14 days — long enough for on-call rotation to review
+  visibility_timeout_seconds = 30      # standard for consumer-less audit queues
+  kms_master_key_id          = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : "alias/aws/sqs"
 
   tags = { Name = "ood-alarm-dlq-${var.environment}" }
+}
+
+# M3: alarm fires if messages accumulate in the DLQ — means SNS→SQS delivery worked
+# but the intended consumers (operators) have not drained the queue.
+resource "aws_cloudwatch_metric_alarm" "alarm_dlq_depth" {
+  count               = var.enable_monitoring ? 1 : 0
+  alarm_name          = "ood-${var.environment}-alarm-dlq-depth"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "OOD ${var.environment} alarm DLQ has unread messages — review CloudWatch alarm delivery failures"
+  alarm_actions       = [aws_sns_topic.ood[0].arn]
+  treat_missing_data  = "notBreaching" # empty queue = healthy
+  dimensions = {
+    QueueName = aws_sqs_queue.alarm_dlq[0].name
+  }
 }
 
 resource "aws_sqs_queue_policy" "alarm_dlq" {
@@ -2587,6 +2698,16 @@ resource "aws_kms_key" "ood" {
   })
 
   tags = { Name = "ood-cmk-${var.environment}" }
+
+  lifecycle {
+    # M2: prod deployments should use CMK so all encrypted resources (EFS, DynamoDB, S3, SNS,
+    # CloudWatch Logs) are under customer control rather than AWS-managed keys.
+    # Set enable_kms_cmk=true in prod.tfvars to satisfy this.
+    precondition {
+      condition     = var.environment != "prod" || var.enable_kms_cmk
+      error_message = "Production deployments require enable_kms_cmk=true for full customer control of encryption keys."
+    }
+  }
 }
 
 resource "aws_kms_alias" "ood" {

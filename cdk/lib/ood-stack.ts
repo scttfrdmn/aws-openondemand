@@ -1050,9 +1050,12 @@ export class OodStack extends cdk.Stack {
         });
       }
 
+      // M4: Always encrypt the alarm topic — use CMK when available, otherwise fall back to
+      // the AWS-managed SNS key. Never leave alarm notifications unencrypted.
+      const snsKey = cmk ?? kms.Alias.fromAliasName(this, "SnsManagedKey", "alias/aws/sns");
       alarmTopic = new sns.Topic(this, "AlarmTopic", {
         topicName: `ood-alarms-${props.environment}`,
-        masterKey: cmk, // H2: encrypt SNS messages with CMK when enabled
+        masterKey: snsKey,
       });
       if (alarmEmail) {
         alarmTopic.addSubscription(

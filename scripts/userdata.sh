@@ -71,6 +71,8 @@ OOD_OIDC_CLIENT_SECRET=""
 if [ -n "${OOD_OIDC_CLIENT_SECRET_ARN}" ]; then
   # L3: capture stderr so AccessDeniedException and other errors are visible in bootstrap log
   SM_ERROR_LOG=$(mktemp)
+  # L1: ensure temp file is removed even if the script exits unexpectedly (signal, set -e, etc.)
+  trap 'rm -f "${SM_ERROR_LOG}"' EXIT
   OOD_OIDC_CLIENT_SECRET=$(aws secretsmanager get-secret-value \
     --region "${AWS_REGION}" \
     --secret-id "${OOD_OIDC_CLIENT_SECRET_ARN}" \

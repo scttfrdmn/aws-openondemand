@@ -22,6 +22,14 @@ variable "subnet_id" {
   default = ""
 }
 
+variable "oidc_pam_version" {
+  type    = string
+  default = ""
+  # L3: must be set to a specific release tag for reproducible AMI builds.
+  # Pass -var oidc_pam_version=v1.2.3 in CI/bake pipelines.
+  # bake.sh will exit 1 if this is empty (enforced in the script).
+}
+
 variable "git_sha" {
   type    = string
   default = ""
@@ -87,6 +95,7 @@ build {
     execute_command = "sudo -E bash '{{.Path}}'"
     environment_vars = [
       "GIT_SHA=${var.git_sha}",
+      "OIDC_PAM_VERSION=${var.oidc_pam_version}",
     ]
   }
 }

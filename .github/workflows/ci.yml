@@ -73,6 +73,18 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # L1: actions/checkout@v4.3.1
 
+      # H5: CKV_AWS_79 (IMDSv2) is suppressed in .checkov.yaml because checkov cannot detect
+      # metadata_options inside a dynamic block. This grep step ensures the suppression is
+      # valid — if http_tokens="required" is removed, this step fails and blocks the PR.
+      - name: Verify IMDSv2 enforcement (CKV_AWS_79 suppression guard)
+        run: |
+          grep -q 'http_tokens.*=.*"required"' terraform/main.tf || {
+            echo "ERROR: IMDSv2 enforcement (http_tokens = \"required\") not found in terraform/main.tf"
+            echo "       CKV_AWS_79 is suppressed in .checkov.yaml assuming this control is present."
+            echo "       Either restore the metadata_options block or remove the suppression."
+            exit 1
+          }
+
       - name: tfsec (Terraform static analysis)
         uses: aquasecurity/tfsec-action@a73ebc46fba54691e25cbe901656e7b205fb9bf2 # L1: tfsec-action@v1.0.0
         with:
