@@ -66,3 +66,32 @@ jobs:
 
       - name: Validate Packer template
         run: packer validate packer/ood.pkr.hcl
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tfsec (Terraform static analysis)
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform
+          soft_fail: false
+
+      - name: checkov (IaC policy scan)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform
+          framework: terraform
+          soft_fail: false
+          skip_check: CKV_AWS_79  # IMDSv2 enforced via launch template, not checkov-visible
+
+      - name: trivy (secret scan)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: "."
+          scanners: secret
+          exit-code: "1"
+          severity: HIGH,CRITICAL

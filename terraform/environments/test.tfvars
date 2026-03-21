@@ -43,7 +43,7 @@ enable_advanced_monitoring = false
 enable_compliance_logging  = false
 enable_backup              = false
 enable_kms_cmk             = false
-enable_packer_ami          = true  # Use pre-baked OOD AMI (ami-0a3ca20950d8cff2c)
+enable_packer_ami          = true # Use pre-baked OOD AMI (ami-0a3ca20950d8cff2c)
 
 # --- Compute backends ---
 adapters_enabled = [] # Portal only — add backends later

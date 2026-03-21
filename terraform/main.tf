@@ -315,18 +315,33 @@ resource "aws_iam_role_policy" "cw" {
   role        = aws_iam_role.ood.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "cloudwatch:PutMetricData",
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents",
-        "logs:DescribeLogStreams",
-        "logs:DescribeLogGroups",
-      ]
-      Resource = "*"
-    }]
+    Statement = [
+      {
+        # cloudwatch:PutMetricData requires Resource="*" (no resource-level support)
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+      },
+      {
+        # Log actions scoped to OOD log group prefix and SSM session logs
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams",
+          "logs:DescribeLogGroups",
+        ]
+        Resource = [
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/ood-${var.environment}",
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/ood-${var.environment}/*",
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/ood-${var.environment}:*",
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ssm/ood-${var.environment}",
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ssm/ood-${var.environment}/*",
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ssm/ood-${var.environment}:*",
+        ]
+      }
+    ]
   })
 }
 
@@ -338,7 +353,7 @@ resource "aws_iam_role_policy" "ssm_params" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
+      Effect = "Allow"
       Action = ["ssm:GetParametersByPath", "ssm:GetParameter", "ssm:GetParameters"]
       Resource = [
         "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/ood/${var.environment}",
@@ -362,7 +377,6 @@ resource "aws_iam_role_policy" "dynamodb_uid" {
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
         "dynamodb:Query",
-        "dynamodb:Scan",
       ]
       Resource = aws_dynamodb_table.uid_map[0].arn
     }]
@@ -409,7 +423,7 @@ resource "aws_iam_role_policy" "s3_browser" {
     Version = "2012-10-17"
     Statement = [{
       Effect = "Allow"
-      Action = ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+      Action = ["s3:ListBucket", "s3:GetObject", "s3:PutObject"]
       Resource = [
         aws_s3_bucket.ood_files[0].arn,
         "${aws_s3_bucket.ood_files[0].arn}/*",
@@ -418,67 +432,93 @@ resource "aws_iam_role_policy" "s3_browser" {
   })
 }
 
-# AWS Batch adapter IAM
+# AWS Batch adapter IAM — scoped to OOD job queue and job definitions
 resource "aws_iam_role_policy" "batch_adapter" {
   count       = local.enable_batch ? 1 : 0
   name_prefix = "ood-aws-batch-adapter-"
   role        = aws_iam_role.ood.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "batch:SubmitJob",
-        "batch:DescribeJobs",
-        "batch:TerminateJob",
-        "batch:ListJobs",
-        "batch:DescribeJobDefinitions",
-        "batch:DescribeJobQueues",
-      ]
-      Resource = "*"
-    }]
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["batch:SubmitJob", "batch:TerminateJob", "batch:ListJobs"]
+        Resource = [
+          aws_batch_job_queue.ood[0].arn,
+          "arn:aws:batch:${var.aws_region}:${data.aws_caller_identity.current.account_id}:job-definition/ood-${var.environment}-*",
+        ]
+      },
+      {
+        # Describe actions require Resource="*" (no resource-level support)
+        Effect   = "Allow"
+        Action   = ["batch:DescribeJobs", "batch:DescribeJobDefinitions", "batch:DescribeJobQueues"]
+        Resource = "*"
+      }
+    ]
   })
 }
 
-# SageMaker adapter IAM
+# SageMaker adapter IAM — mutating actions scoped to OOD domain
 resource "aws_iam_role_policy" "sagemaker_adapter" {
   count       = local.enable_sagemaker ? 1 : 0
   name_prefix = "ood-sagemaker-adapter-"
   role        = aws_iam_role.ood.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "sagemaker:CreateApp",
-        "sagemaker:DeleteApp",
-        "sagemaker:DescribeApp",
-        "sagemaker:ListApps",
-        "sagemaker:CreatePresignedDomainUrl",
-      ]
-      Resource = "*"
-    }]
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["sagemaker:CreateApp", "sagemaker:DeleteApp", "sagemaker:CreatePresignedDomainUrl"]
+        Resource = [
+          aws_sagemaker_domain.ood[0].arn,
+          "${aws_sagemaker_domain.ood[0].arn}/*",
+        ]
+      },
+      {
+        # Describe/List actions require Resource="*"
+        Effect   = "Allow"
+        Action   = ["sagemaker:DescribeApp", "sagemaker:ListApps"]
+        Resource = "*"
+      }
+    ]
   })
 }
 
-# EC2 adapter IAM
+# EC2 adapter IAM — mutating actions scoped to tagged OOD instances and region
 resource "aws_iam_role_policy" "ec2_adapter" {
   count       = local.enable_ec2_adapter ? 1 : 0
   name_prefix = "ood-ec2-adapter-"
   role        = aws_iam_role.ood.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "ec2:RunInstances",
-        "ec2:TerminateInstances",
-        "ec2:DescribeInstances",
-        "ec2:DescribeInstanceStatus",
-        "ec2:CreateTags",
-      ]
-      Resource = "*"
-    }]
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["ec2:RunInstances"]
+        Resource = [
+          "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
+          "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:subnet/*",
+          "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:security-group/*",
+          "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:network-interface/*",
+          "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/*",
+          "arn:aws:ec2:${var.aws_region}::image/*",
+        ]
+        Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }
+      },
+      {
+        # Terminate/tag only instances tagged as OOD-managed
+        Effect    = "Allow"
+        Action    = ["ec2:TerminateInstances", "ec2:CreateTags"]
+        Resource  = "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*"
+        Condition = { StringEquals = { "ec2:ResourceTag/Project" = "aws-openondemand" } }
+      },
+      {
+        # Describe actions require Resource="*"
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus"]
+        Resource = "*"
+      }
+    ]
   })
 }
 
@@ -584,7 +624,7 @@ resource "aws_dynamodb_table" "uid_map" {
   }
 
   point_in_time_recovery {
-    enabled = var.environment == "prod"
+    enabled = true
   }
 
   server_side_encryption {
@@ -986,7 +1026,7 @@ resource "aws_lb" "ood" {
   security_groups    = [aws_security_group.alb[0].id]
   subnets            = [var.subnet_id]
 
-  enable_deletion_protection = var.environment == "prod"
+  enable_deletion_protection = var.environment != "test"
 
   tags = {
     Name = "ood-${var.environment}"
@@ -1073,6 +1113,25 @@ resource "aws_wafv2_web_acl" "ood" {
 
   default_action {
     allow {}
+  }
+
+  rule {
+    name     = "RateLimit"
+    priority = 0
+    action {
+      block {}
+    }
+    statement {
+      rate_based_statement {
+        limit              = 2000
+        aggregate_key_type = "IP"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "RateLimit"
+      sampled_requests_enabled   = true
+    }
   }
 
   rule {
@@ -1397,6 +1456,40 @@ resource "aws_cloudwatch_dashboard" "ood" {
 }
 
 # ---------------------------------------------------------------------------
+# SSM Session Manager — audit logging
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_log_group" "ssm_sessions" {
+  count             = var.enable_monitoring ? 1 : 0
+  name              = "/aws/ssm/ood-${var.environment}/sessions"
+  retention_in_days = local.log_retention
+  kms_key_id        = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+
+  tags = { Name = "ood-ssm-sessions-${var.environment}" }
+}
+
+resource "aws_ssm_document" "session_manager_prefs" {
+  count         = var.enable_monitoring ? 1 : 0
+  name          = "SSM-SessionManagerRunShell-ood-${var.environment}"
+  document_type = "Session"
+
+  content = jsonencode({
+    schemaVersion = "1.0"
+    description   = "OOD ${var.environment} SSM session preferences — logs to CloudWatch"
+    sessionType   = "Standard_Stream"
+    inputs = {
+      cloudWatchLogGroupName      = aws_cloudwatch_log_group.ssm_sessions[0].name
+      cloudWatchEncryptionEnabled = var.enable_kms_cmk
+      cloudWatchStreamingEnabled  = true
+      s3BucketName                = ""
+      s3KeyPrefix                 = ""
+      s3EncryptionEnabled         = false
+    }
+  })
+
+  tags = { Name = "ood-session-prefs-${var.environment}" }
+}
+
+# ---------------------------------------------------------------------------
 # AWS Batch (conditional on adapters_enabled containing "batch")
 # ---------------------------------------------------------------------------
 resource "aws_iam_role" "batch_service" {
@@ -1592,6 +1685,26 @@ resource "aws_s3_bucket" "cloudtrail" {
   bucket_prefix = "ood-cloudtrail-${var.environment}-"
 
   tags = { Name = "ood-cloudtrail-${var.environment}" }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "cloudtrail" {
+  count  = var.enable_compliance_logging ? 1 : 0
+  bucket = aws_s3_bucket.cloudtrail[0].id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = var.enable_kms_cmk ? "aws:kms" : "AES256"
+      kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+    }
+    bucket_key_enabled = var.enable_kms_cmk
+  }
+}
+
+resource "aws_s3_bucket_versioning" "cloudtrail" {
+  count  = var.enable_compliance_logging ? 1 : 0
+  bucket = aws_s3_bucket.cloudtrail[0].id
+  versioning_configuration {
+    status = "Enabled"
+  }
 }
 
 resource "aws_s3_bucket_policy" "cloudtrail" {

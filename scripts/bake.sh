@@ -50,7 +50,7 @@ systemctl enable fail2ban
 ONDEMAND_RELEASE_URL="https://yum.osc.edu/ondemand/4.0/ondemand-release-web-4.0-1.amzn2023.noarch.rpm"
 dnf -y install "${ONDEMAND_RELEASE_URL}"
 
-dnf -y install ondemand
+dnf -y install ondemand-4.0.10
 
 # Enable OOD services (OOD 4.x on AL2023 uses httpd.service with drop-in configs)
 systemctl enable httpd || true
@@ -82,14 +82,32 @@ else
   OIDC_PAM_ARCH="${ARCH}"
 fi
 
-OIDC_PAM_URL="https://github.com/scttfrdmn/oidc-pam/releases/download/${OIDC_PAM_VERSION}/oidc-pam_linux_${OIDC_PAM_ARCH}.tar.gz"
+OIDC_PAM_TGZ_URL="https://github.com/scttfrdmn/oidc-pam/releases/download/${OIDC_PAM_VERSION}/oidc-pam_linux_${OIDC_PAM_ARCH}.tar.gz"
+OIDC_PAM_SHA_URL="https://github.com/scttfrdmn/oidc-pam/releases/download/${OIDC_PAM_VERSION}/checksums.txt"
 echo "=== Installing oidc-pam ${OIDC_PAM_VERSION} ==="
-if curl -fsSL --head "${OIDC_PAM_URL}" 2>/dev/null | grep -q "200\|302"; then
-  curl -fsSL "${OIDC_PAM_URL}" | tar -xz -C /usr/local/bin/
+if curl -fsSL --head "${OIDC_PAM_TGZ_URL}" 2>/dev/null | grep -q "200\|302"; then
+  TMPDIR=$(mktemp -d)
+  TGZ="${TMPDIR}/oidc-pam.tar.gz"
+  curl -fsSL "${OIDC_PAM_TGZ_URL}" -o "${TGZ}"
+  # Verify SHA256 checksum when checksums.txt is available
+  if curl -fsSL "${OIDC_PAM_SHA_URL}" -o "${TMPDIR}/checksums.txt" 2>/dev/null; then
+    EXPECTED=$(grep "oidc-pam_linux_${OIDC_PAM_ARCH}.tar.gz" "${TMPDIR}/checksums.txt" | awk '{print $1}')
+    ACTUAL=$(sha256sum "${TGZ}" | awk '{print $1}')
+    if [ "${EXPECTED}" != "${ACTUAL}" ]; then
+      echo "ERROR: oidc-pam checksum mismatch — aborting install"
+      rm -rf "${TMPDIR}"
+      exit 1
+    fi
+    echo "oidc-pam checksum verified: ${ACTUAL}"
+  else
+    echo "WARNING: checksums.txt not available — skipping checksum verification"
+  fi
+  tar -xz -C /usr/local/bin/ -f "${TGZ}"
+  rm -rf "${TMPDIR}"
   chmod 755 /usr/local/bin/oidc-pam /usr/local/bin/oidc-auth-broker 2>/dev/null || true
   echo "=== oidc-pam ${OIDC_PAM_VERSION} installed ==="
 else
-  echo "WARNING: oidc-pam binary not available at ${OIDC_PAM_URL} — skipping"
+  echo "WARNING: oidc-pam binary not available at ${OIDC_PAM_TGZ_URL} — skipping"
   echo "         Install manually when binaries are published"
 fi
 
@@ -160,14 +178,27 @@ PHPINI
 fi
 
 ###############################################################################
-# 7. Security: SELinux policies for OOD
+# 7. AIDE file integrity baseline
+###############################################################################
+# Install AIDE and initialize the database now so userdata.sh can run --check
+dnf -y install aide
+# Generate default config if not present
+[ -f /etc/aide.conf ] || aide --init 2>/dev/null || true
+aide --init 2>/dev/null || true
+# Move the generated database into place
+if [ -f /var/lib/aide/aide.db.new.gz ]; then
+  cp /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+fi
+
+###############################################################################
+# 8. Security: SELinux policies for OOD
 ###############################################################################
 # Allow nginx/passenger to connect to network (needed for OOD sub-apps)
 setsebool -P httpd_can_network_connect 1 2>/dev/null || true
 setsebool -P httpd_can_network_relay 1 2>/dev/null || true
 
 ###############################################################################
-# 8. CloudWatch Agent service enabled (configured at launch by userdata.sh)
+# 9. CloudWatch Agent service enabled (configured at launch by userdata.sh)
 ###############################################################################
 systemctl enable amazon-cloudwatch-agent
 

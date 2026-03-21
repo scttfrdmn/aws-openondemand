@@ -6,13 +6,16 @@
 #   terraform apply -var-file=environments/staging.tfvars \
 #     -var='vpc_id=vpc-xxx' \
 #     -var='subnet_id=subnet-xxx' \
-#     -var='allowed_cidr=0.0.0.0/0' \
+#     -var='allowed_cidr=203.0.113.0/24' \   # Replace with your institution's CIDR
 #     -var='domain_name=ood-staging.university.edu'
+#
+# NOTE: allowed_cidr must NOT be 0.0.0.0/0 — Terraform will reject it.
+# Use your institution's egress CIDR or a specific IP range.
 
 # --- Required (no defaults) ---
 # vpc_id       = "vpc-..."
 # subnet_id    = "subnet-..."
-# allowed_cidr = "0.0.0.0/0"
+# allowed_cidr = "203.0.113.0/24"  # Replace with your institution's CIDR
 # domain_name  = "ood-staging.university.edu"
 
 # --- Profile ---

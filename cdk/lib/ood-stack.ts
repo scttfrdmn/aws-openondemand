@@ -293,7 +293,7 @@ export class OodStack extends cdk.Stack {
         tableName: `oid-uid-map-${props.environment}`,
         partitionKey: { name: "oidc_sub", type: dynamodb.AttributeType.STRING },
         billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-        pointInTimeRecovery: props.environment === "prod",
+        pointInTimeRecovery: true,
         encryption: enableKmsCmk
           ? dynamodb.TableEncryption.CUSTOMER_MANAGED
           : dynamodb.TableEncryption.AWS_MANAGED,
@@ -394,18 +394,28 @@ export class OodStack extends cdk.Stack {
       ],
     });
 
-    // CloudWatch permissions (always needed)
+    // CloudWatch permissions — metrics to "*", log actions scoped to OOD log groups
+    instanceRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ["cloudwatch:PutMetricData"],
+        resources: ["*"],
+      })
+    );
     instanceRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: [
-          "cloudwatch:PutMetricData",
           "logs:CreateLogGroup",
           "logs:CreateLogStream",
           "logs:PutLogEvents",
           "logs:DescribeLogStreams",
           "logs:DescribeLogGroups",
         ],
-        resources: ["*"],
+        resources: [
+          `arn:aws:logs:${this.region}:${this.account}:log-group:${logGroupPrefix}`,
+          `arn:aws:logs:${this.region}:${this.account}:log-group:${logGroupPrefix}/*`,
+          `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/ssm/ood-${props.environment}`,
+          `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/ssm/ood-${props.environment}/*`,
+        ],
       })
     );
 
@@ -426,9 +436,20 @@ export class OodStack extends cdk.Stack {
       );
     }
 
-    // DynamoDB UID table access
+    // DynamoDB UID table access (explicit — no Scan permission)
     if (enableDynamodbUid && uidTable) {
-      uidTable.grantReadWriteData(instanceRole);
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:DeleteItem",
+            "dynamodb:Query",
+          ],
+          resources: [uidTable.tableArn],
+        })
+      );
     }
 
     // EFS mount access (ClientMount + DescribeMountTargets for IAM auth DNS fallback)
@@ -456,19 +477,41 @@ export class OodStack extends cdk.Stack {
       );
     }
 
-    // S3 browser access
+    // S3 browser access (explicit — no DeleteObject permission)
     if (enableS3Browser && s3BrowserBucket) {
-      s3BrowserBucket.grantReadWrite(instanceRole);
-    }
-
-    // Adapter IAM policies
-    if (adaptersEnabled.includes("batch")) {
       instanceRole.addToPrincipalPolicy(
         new iam.PolicyStatement({
           actions: [
-            "batch:SubmitJob",
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:ListBucket",
+            "s3:GetBucketLocation",
+          ],
+          resources: [
+            s3BrowserBucket.bucketArn,
+            `${s3BrowserBucket.bucketArn}/*`,
+          ],
+        })
+      );
+    }
+
+    // Adapter IAM policies (mutating actions scoped, read-only to "*")
+    if (adaptersEnabled.includes("batch")) {
+      // Mutating: scoped to job queues and job definitions for this environment
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["batch:SubmitJob", "batch:TerminateJob"],
+          resources: [
+            `arn:aws:batch:${this.region}:${this.account}:job-queue/ood-${props.environment}*`,
+            `arn:aws:batch:${this.region}:${this.account}:job-definition/ood-${props.environment}*`,
+          ],
+        })
+      );
+      // Read-only: needs "*" for describe/list
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: [
             "batch:DescribeJobs",
-            "batch:TerminateJob",
             "batch:ListJobs",
             "batch:DescribeJobDefinitions",
             "batch:DescribeJobQueues",
@@ -479,30 +522,64 @@ export class OodStack extends cdk.Stack {
     }
 
     if (adaptersEnabled.includes("sagemaker")) {
+      // Mutating: scoped to domains for this environment
       instanceRole.addToPrincipalPolicy(
         new iam.PolicyStatement({
           actions: [
             "sagemaker:CreateApp",
             "sagemaker:DeleteApp",
-            "sagemaker:DescribeApp",
-            "sagemaker:ListApps",
             "sagemaker:CreatePresignedDomainUrl",
           ],
+          resources: [
+            `arn:aws:sagemaker:${this.region}:${this.account}:domain/ood-${props.environment}*`,
+          ],
+        })
+      );
+      // Read-only: needs "*" for describe/list
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["sagemaker:DescribeApp", "sagemaker:ListApps"],
           resources: ["*"],
         })
       );
     }
 
     if (adaptersEnabled.includes("ec2")) {
+      // RunInstances: scoped to instances/subnets/security groups with project tag condition
       instanceRole.addToPrincipalPolicy(
         new iam.PolicyStatement({
-          actions: [
-            "ec2:RunInstances",
-            "ec2:TerminateInstances",
-            "ec2:DescribeInstances",
-            "ec2:DescribeInstanceStatus",
-            "ec2:CreateTags",
+          actions: ["ec2:RunInstances"],
+          resources: [
+            `arn:aws:ec2:${this.region}:${this.account}:instance/*`,
+            `arn:aws:ec2:${this.region}:${this.account}:subnet/*`,
+            `arn:aws:ec2:${this.region}:${this.account}:security-group/*`,
+            `arn:aws:ec2:${this.region}:${this.account}:network-interface/*`,
+            `arn:aws:ec2:${this.region}:${this.account}:volume/*`,
+            `arn:aws:ec2:${this.region}::image/*`,
           ],
+          conditions: {
+            StringEquals: { "aws:RequestedRegion": this.region },
+          },
+        })
+      );
+      // Terminate/tag: scoped to instances tagged with this project
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["ec2:TerminateInstances", "ec2:CreateTags"],
+          resources: [
+            `arn:aws:ec2:${this.region}:${this.account}:instance/*`,
+          ],
+          conditions: {
+            StringEquals: {
+              "aws:ResourceTag/Project": `ood-${props.environment}`,
+            },
+          },
+        })
+      );
+      // Read-only: needs "*"
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus"],
           resources: ["*"],
         })
       );
@@ -643,7 +720,7 @@ export class OodStack extends cdk.Stack {
         vpc,
         internetFacing: true,
         securityGroup: albSg,
-        deletionProtection: props.environment === "prod",
+        deletionProtection: props.environment !== "test",
       });
 
       const targetGroup = new elbv2.ApplicationTargetGroup(
@@ -700,6 +777,22 @@ export class OodStack extends cdk.Stack {
         scope: "REGIONAL",
         defaultAction: { allow: {} },
         rules: [
+          {
+            name: "RateLimit",
+            priority: 0,
+            action: { block: {} },
+            statement: {
+              rateBasedStatement: {
+                limit: 2000,
+                aggregateKeyType: "IP",
+              },
+            },
+            visibilityConfig: {
+              cloudWatchMetricsEnabled: true,
+              metricName: "RateLimit",
+              sampledRequestsEnabled: true,
+            },
+          },
           {
             name: "CommonRuleSet",
             priority: 1,

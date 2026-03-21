@@ -35,6 +35,10 @@ variable "allowed_cidr" {
     condition     = can(cidrhost(var.allowed_cidr, 0))
     error_message = "allowed_cidr must be a valid CIDR block (e.g. 203.0.113.5/32)."
   }
+  validation {
+    condition     = var.allowed_cidr != "0.0.0.0/0"
+    error_message = "allowed_cidr must not be 0.0.0.0/0. Specify your institution's CIDR (e.g. 203.0.113.0/24)."
+  }
 }
 
 variable "domain_name" {
