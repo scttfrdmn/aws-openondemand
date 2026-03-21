@@ -248,6 +248,15 @@ resource "aws_security_group" "efs" {
     security_groups = [aws_security_group.ood.id]
   }
 
+  # M3: explicit egress overrides the default allow-all rule
+  egress {
+    description     = "NFS replies to OOD instance"
+    from_port       = 2049
+    to_port         = 2049
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ood.id]
+  }
+
   lifecycle {
     create_before_destroy = true
   }
@@ -263,6 +272,15 @@ resource "aws_security_group" "elasticache" {
 
   ingress {
     description     = "Redis from OOD instance"
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ood.id]
+  }
+
+  # M4: explicit egress overrides the default allow-all rule
+  egress {
+    description     = "Redis replies to OOD instance"
     from_port       = 6379
     to_port         = 6379
     protocol        = "tcp"
@@ -776,6 +794,10 @@ resource "aws_s3_bucket" "ood_files" {
   tags = {
     Name = "ood-files-${var.environment}"
   }
+
+  lifecycle {
+    prevent_destroy = true # H4: protect user data from accidental destroy
+  }
 }
 
 resource "aws_s3_bucket_versioning" "ood_files" {
@@ -920,11 +942,21 @@ resource "aws_ssm_parameter" "dynamodb_uid_table" {
   value = aws_dynamodb_table.uid_map[0].name
 }
 
+# M5: split endpoint URL (non-secret) from auth token (secret) so the token
+# never appears in SSM history for a plain String parameter
 resource "aws_ssm_parameter" "redis_endpoint" {
   count = var.enable_parameter_store && var.enable_session_cache ? 1 : 0
   name  = "/ood/${var.environment}/redis_endpoint"
-  type  = "SecureString"
-  value = "rediss://:${random_password.redis_auth[0].result}@${aws_elasticache_replication_group.ood[0].primary_endpoint_address}:6379"
+  type  = "String"
+  value = "rediss://${aws_elasticache_replication_group.ood[0].primary_endpoint_address}:6379"
+}
+
+resource "aws_ssm_parameter" "redis_auth_token" {
+  count  = var.enable_parameter_store && var.enable_session_cache ? 1 : 0
+  name   = "/ood/${var.environment}/redis_auth_token"
+  type   = "SecureString"
+  value  = random_password.redis_auth[0].result
+  key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
 }
 
 # ---------------------------------------------------------------------------
@@ -1028,6 +1060,7 @@ resource "aws_autoscaling_group" "ood" {
 
   health_check_type         = var.enable_alb ? "ELB" : "EC2"
   health_check_grace_period = 300
+  default_instance_warmup   = 120 # L4: allow metrics to stabilize before scale decisions
 
   tag {
     key                 = "Name"
@@ -1101,6 +1134,10 @@ resource "aws_s3_bucket" "alb_logs" {
   count         = var.enable_alb ? 1 : 0
   bucket_prefix = "ood-alb-logs-${var.environment}-"
   tags          = { Name = "ood-alb-logs-${var.environment}" }
+
+  lifecycle {
+    prevent_destroy = true # H5: preserve audit logs from accidental destroy
+  }
 }
 
 resource "aws_s3_bucket_public_access_block" "alb_logs" {
@@ -1520,8 +1557,9 @@ resource "aws_cloudwatch_log_group" "passenger" {
 }
 
 resource "aws_sns_topic" "ood" {
-  count = var.enable_monitoring ? 1 : 0
-  name  = "ood-alarms-${var.environment}"
+  count             = var.enable_monitoring ? 1 : 0
+  name              = "ood-alarms-${var.environment}"
+  kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null # C1: encrypt SNS with CMK
 }
 
 resource "aws_sns_topic_subscription" "email" {
@@ -1927,6 +1965,10 @@ resource "aws_s3_bucket" "cloudtrail" {
   bucket_prefix = "ood-cloudtrail-${var.environment}-"
 
   tags = { Name = "ood-cloudtrail-${var.environment}" }
+
+  lifecycle {
+    prevent_destroy = true # M2: preserve compliance audit trail from accidental destroy
+  }
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "cloudtrail" {
@@ -2064,8 +2106,8 @@ resource "aws_backup_plan" "ood" {
 }
 
 resource "aws_backup_selection" "ood" {
-  # Create backup selection whenever backup is enabled and there is at least one resource to back up (M5)
-  count        = var.enable_backup && (var.enable_efs || var.enable_dynamodb_uid) ? 1 : 0
+  # M9: include S3 browser bucket alongside EFS + DynamoDB
+  count        = var.enable_backup && (var.enable_efs || var.enable_dynamodb_uid || var.enable_s3_browser) ? 1 : 0
   iam_role_arn = aws_iam_role.backup[0].arn
   name         = "ood-${var.environment}"
   plan_id      = aws_backup_plan.ood[0].id
@@ -2073,6 +2115,7 @@ resource "aws_backup_selection" "ood" {
   resources = concat(
     var.enable_efs ? [aws_efs_file_system.home[0].arn] : [],
     var.enable_dynamodb_uid ? [aws_dynamodb_table.uid_map[0].arn] : [],
+    var.enable_s3_browser ? [aws_s3_bucket.ood_files[0].arn] : [],
   )
 }
 

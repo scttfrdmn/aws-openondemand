@@ -80,6 +80,10 @@ export class OodStack extends cdk.Stack {
       );
     }
 
+    // H7: apply project/environment tags to every taggable resource in the stack
+    cdk.Tags.of(this).add("Project", "aws-openondemand");
+    cdk.Tags.of(this).add("Environment", props.environment);
+
     const config = ENV_CONFIG[props.environment];
 
     // --- Context-based configuration (same pattern as aws-hubzero) ---
@@ -629,10 +633,22 @@ export class OodStack extends cdk.Stack {
       `export OOD_S3_BROWSER_BUCKET="${s3BrowserBucket ? s3BrowserBucket.bucketName : ""}"`,
       `export OOD_ADAPTERS_ENABLED='${JSON.stringify(adaptersEnabled)}'`,
       `export OOD_LOG_GROUP_PREFIX="${logGroupPrefix}"`,
-      enablePackerAmi
-        ? "# Baked AMI — bake.sh already applied at image build time"
-        : `curl -fsSL "${baseUrl}/bake.sh" | bash`,
-      `curl -fsSL "${baseUrl}/userdata.sh" | bash`
+      // H3: download-then-verify-then-run instead of curl|bash to prevent
+      // truncated-download execution and enable SHA verification
+      ...(enablePackerAmi
+        ? ["# Baked AMI — bake.sh already applied at image build time"]
+        : [
+            `curl -fsSL "${baseUrl}/bake.sh" -o /tmp/bake.sh`,
+            `curl -fsSL "${baseUrl}/bake.sh.sha256" -o /tmp/bake.sh.sha256 || true`,
+            `if [ -s /tmp/bake.sh.sha256 ]; then sha256sum -c /tmp/bake.sh.sha256 || { echo "bake.sh checksum mismatch" >&2; exit 1; }; fi`,
+            `bash /tmp/bake.sh`,
+            `rm -f /tmp/bake.sh /tmp/bake.sh.sha256`,
+          ]),
+      `curl -fsSL "${baseUrl}/userdata.sh" -o /tmp/userdata.sh`,
+      `curl -fsSL "${baseUrl}/userdata.sh.sha256" -o /tmp/userdata.sh.sha256 || true`,
+      `if [ -s /tmp/userdata.sh.sha256 ]; then sha256sum -c /tmp/userdata.sh.sha256 || { echo "userdata.sh checksum mismatch" >&2; exit 1; }; fi`,
+      `bash /tmp/userdata.sh`,
+      `rm -f /tmp/userdata.sh /tmp/userdata.sh.sha256`
     );
 
     // --- Launch Template ---
@@ -673,6 +689,7 @@ export class OodStack extends cdk.Stack {
       healthCheck: enableAlb
         ? autoscaling.HealthCheck.elb({ grace: cdk.Duration.minutes(5) })
         : autoscaling.HealthCheck.ec2(),
+      defaultInstanceWarmup: cdk.Duration.seconds(120), // L4: stabilize metrics before scale decisions
     });
 
     cdk.Tags.of(asg).add("Name", `ood-${props.environment}`);
@@ -877,6 +894,37 @@ export class OodStack extends cdk.Stack {
       this.node.tryGetContext("cloudfrontWafArn") || "";
 
     if (enableCdn && alb) {
+      // L1: security response headers policy — HSTS, X-Frame-Options, content-type nosniff
+      const securityHeadersPolicy = new cloudfront.ResponseHeadersPolicy(
+        this,
+        "SecurityHeaders",
+        {
+          securityHeadersBehavior: {
+            strictTransportSecurity: {
+              accessControlMaxAge: cdk.Duration.days(365),
+              includeSubdomains: true,
+              preload: true,
+              override: true,
+            },
+            frameOptions: {
+              frameOption: cloudfront.HeadersFrameOption.DENY,
+              override: true,
+            },
+            contentTypeOptions: { override: true },
+            referrerPolicy: {
+              referrerPolicy:
+                cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
+              override: true,
+            },
+            xssProtection: {
+              protection: true,
+              modeBlock: true,
+              override: true,
+            },
+          },
+        }
+      );
+
       new cloudfront.Distribution(this, "Cdn", {
         comment: `OOD ${props.environment} CDN`,
         webAclId: cloudfrontWafArn || undefined,
@@ -889,6 +937,7 @@ export class OodStack extends cdk.Stack {
           cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
           allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
           compress: true,
+          responseHeadersPolicy: securityHeadersPolicy,
         },
         additionalBehaviors: {
           "/public/*": {
@@ -900,6 +949,7 @@ export class OodStack extends cdk.Stack {
             cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
             allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
             compress: true,
+            responseHeadersPolicy: securityHeadersPolicy,
           },
         },
       });
@@ -918,11 +968,13 @@ export class OodStack extends cdk.Stack {
           logGroupName: `${logGroupPrefix}/${name}`,
           retention: config.logRetention,
           removalPolicy: cdk.RemovalPolicy.DESTROY,
+          encryptionKey: cmk, // H1: encrypt log data with CMK when enabled
         });
       }
 
       alarmTopic = new sns.Topic(this, "AlarmTopic", {
         topicName: `ood-alarms-${props.environment}`,
+        masterKey: cmk, // H2: encrypt SNS messages with CMK when enabled
       });
       if (alarmEmail) {
         alarmTopic.addSubscription(
@@ -1010,14 +1062,49 @@ export class OodStack extends cdk.Stack {
 
     // --- SageMaker Domain (adapter) ---
     if (adaptersEnabled.includes("sagemaker")) {
+      // C2: scoped policy instead of AmazonSageMakerFullAccess (which grants admin-level access)
       const smRole = new iam.Role(this, "SageMakerExecRole", {
         assumedBy: new iam.ServicePrincipal("sagemaker.amazonaws.com"),
-        managedPolicies: [
-          iam.ManagedPolicy.fromAwsManagedPolicyName(
-            "AmazonSageMakerFullAccess"
-          ),
-        ],
       });
+      smRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "sagemaker:CreateApp",
+            "sagemaker:DeleteApp",
+            "sagemaker:DescribeApp",
+            "sagemaker:ListApps",
+            "sagemaker:CreatePresignedDomainUrl",
+            "sagemaker:DescribeDomain",
+            "sagemaker:DescribeUserProfile",
+          ],
+          resources: [
+            `arn:aws:sagemaker:${this.region}:${this.account}:domain/*`,
+            `arn:aws:sagemaker:${this.region}:${this.account}:app/*`,
+            `arn:aws:sagemaker:${this.region}:${this.account}:user-profile/*`,
+          ],
+        })
+      );
+      smRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "logs:CreateLogGroup",
+            "logs:CreateLogStream",
+            "logs:PutLogEvents",
+          ],
+          resources: [
+            `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/sagemaker/*`,
+          ],
+        })
+      );
+      smRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+          resources: [
+            `arn:aws:s3:::sagemaker-${this.region}-${this.account}`,
+            `arn:aws:s3:::sagemaker-${this.region}-${this.account}/*`,
+          ],
+        })
+      );
 
       new sagemaker.CfnDomain(this, "SageMakerDomain", {
         domainName: `ood-${props.environment}`,

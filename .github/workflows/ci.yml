@@ -80,7 +80,7 @@ jobs:
           soft_fail: false
 
       - name: checkov (IaC policy scan)
-        uses: bridgecrewio/checkov-action@master
+        uses: bridgecrewio/checkov-action@3b5b35d8b7e52f27bc58d05e3b56e55a9e5e3ec7 # M1: pinned v3.2.2 — @master is mutable
         with:
           directory: terraform
           framework: terraform
@@ -89,7 +89,7 @@ jobs:
           config_file: .checkov.yaml
 
       - name: trivy (secret scan)
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # M1: pinned v0.28.0 — @master is mutable
         with:
           scan-type: fs
           scan-ref: "."

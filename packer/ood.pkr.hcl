@@ -45,7 +45,7 @@ source "amazon-ebs" "ood" {
   ssh_username  = "ec2-user"
 
   subnet_id                   = var.subnet_id != "" ? var.subnet_id : null
-  associate_public_ip_address = true
+  associate_public_ip_address = false # C3: build in private subnet with NAT; no public IP needed
 
   ami_name        = "ood-base-{{isotime \"2006-01-02-150405\"}}"
   ami_description = "Open OnDemand base AMI - AL2023, OOD latest, oidc-pam, nginx/Passenger, CWAgent"
