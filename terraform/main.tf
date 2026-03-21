@@ -501,9 +501,21 @@ resource "aws_iam_role_policy" "ec2_adapter" {
           "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:security-group/*",
           "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:network-interface/*",
           "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/*",
-          "arn:aws:ec2:${var.aws_region}::image/*",
         ]
         Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }
+      },
+      {
+        # RunInstances on images: restrict to AMIs tagged as OOD project
+        Effect = "Allow"
+        Action = ["ec2:RunInstances"]
+        Resource = [
+          "arn:aws:ec2:${var.aws_region}::image/*",
+        ]
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/Project" = "aws-openondemand"
+          }
+        }
       },
       {
         # Terminate/tag only instances tagged as OOD-managed
@@ -777,6 +789,35 @@ resource "aws_s3_bucket_public_access_block" "ood_files" {
   restrict_public_buckets = true
 }
 
+# S3 server access logging for the OOD files bucket (H1)
+resource "aws_s3_bucket" "ood_files_logs" {
+  count         = var.enable_s3_browser ? 1 : 0
+  bucket_prefix = "ood-files-logs-${var.environment}-"
+  tags          = { Name = "ood-files-logs-${var.environment}" }
+}
+
+resource "aws_s3_bucket_public_access_block" "ood_files_logs" {
+  count                   = var.enable_s3_browser ? 1 : 0
+  bucket                  = aws_s3_bucket.ood_files_logs[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_ownership_controls" "ood_files_logs" {
+  count  = var.enable_s3_browser ? 1 : 0
+  bucket = aws_s3_bucket.ood_files_logs[0].id
+  rule { object_ownership = "BucketOwnerPreferred" }
+}
+
+resource "aws_s3_bucket_logging" "ood_files" {
+  count         = var.enable_s3_browser ? 1 : 0
+  bucket        = aws_s3_bucket.ood_files[0].id
+  target_bucket = aws_s3_bucket.ood_files_logs[0].id
+  target_prefix = "access-logs/"
+}
+
 resource "aws_s3_bucket_lifecycle_configuration" "ood_files" {
   count  = var.enable_s3_browser ? 1 : 0
   bucket = aws_s3_bucket.ood_files[0].id
@@ -887,7 +928,7 @@ resource "aws_launch_template" "ood" {
     content {
       market_type = "spot"
       spot_options {
-        max_price          = "0.20"
+        max_price          = var.spot_max_price != "" ? var.spot_max_price : null
         spot_instance_type = "one-time"
       }
     }
@@ -1016,6 +1057,48 @@ resource "aws_dlm_lifecycle_policy" "ood" {
 }
 
 # ---------------------------------------------------------------------------
+# ALB access logging bucket (M6)
+# ---------------------------------------------------------------------------
+data "aws_elb_service_account" "main" {}
+
+resource "aws_s3_bucket" "alb_logs" {
+  count         = var.enable_alb ? 1 : 0
+  bucket_prefix = "ood-alb-logs-${var.environment}-"
+  tags          = { Name = "ood-alb-logs-${var.environment}" }
+}
+
+resource "aws_s3_bucket_public_access_block" "alb_logs" {
+  count                   = var.enable_alb ? 1 : 0
+  bucket                  = aws_s3_bucket.alb_logs[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "alb_logs" {
+  count  = var.enable_alb ? 1 : 0
+  bucket = aws_s3_bucket.alb_logs[0].id
+  rule {
+    apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
+  }
+}
+
+resource "aws_s3_bucket_policy" "alb_logs" {
+  count  = var.enable_alb ? 1 : 0
+  bucket = aws_s3_bucket.alb_logs[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { AWS = data.aws_elb_service_account.main.arn }
+      Action    = "s3:PutObject"
+      Resource  = "${aws_s3_bucket.alb_logs[0].arn}/alb-logs/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
+    }]
+  })
+}
+
+# ---------------------------------------------------------------------------
 # ALB + ACM (optional)
 # ---------------------------------------------------------------------------
 resource "aws_lb" "ood" {
@@ -1028,9 +1111,17 @@ resource "aws_lb" "ood" {
 
   enable_deletion_protection = var.environment != "test"
 
+  access_logs {
+    bucket  = aws_s3_bucket.alb_logs[0].bucket
+    prefix  = "alb-logs"
+    enabled = true
+  }
+
   tags = {
     Name = "ood-${var.environment}"
   }
+
+  depends_on = [aws_s3_bucket_policy.alb_logs]
 }
 
 resource "aws_lb_target_group" "ood" {
@@ -1584,10 +1675,44 @@ resource "aws_iam_role" "sagemaker_execution" {
   })
 }
 
-resource "aws_iam_role_policy_attachment" "sagemaker_full" {
-  count      = local.enable_sagemaker ? 1 : 0
-  role       = aws_iam_role.sagemaker_execution[0].name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
+# Scoped SageMaker execution policy — replaces AmazonSageMakerFullAccess (H2)
+resource "aws_iam_role_policy" "sagemaker_execution_scoped" {
+  count       = local.enable_sagemaker ? 1 : 0
+  name_prefix = "ood-sagemaker-exec-scoped-"
+  role        = aws_iam_role.sagemaker_execution[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sagemaker:CreateApp",
+          "sagemaker:DeleteApp",
+          "sagemaker:CreatePresignedDomainUrl",
+          "sagemaker:DescribeApp",
+          "sagemaker:ListApps",
+        ]
+        Resource = [
+          aws_sagemaker_domain.ood[0].arn,
+          "${aws_sagemaker_domain.ood[0].arn}/*",
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sagemaker:DescribeDomain", "sagemaker:ListDomains"]
+        Resource = "*"
+      },
+      {
+        # SageMaker needs S3 access for model artifacts and notebook data
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
+        Resource = [
+          "arn:aws:s3:::sagemaker-${var.aws_region}-${data.aws_caller_identity.current.account_id}",
+          "arn:aws:s3:::sagemaker-${var.aws_region}-${data.aws_caller_identity.current.account_id}/*",
+        ]
+      },
+    ]
+  })
 }
 
 resource "aws_sagemaker_domain" "ood" {
@@ -1631,6 +1756,7 @@ resource "aws_cloudwatch_log_group" "flow_log" {
   count             = var.enable_compliance_logging ? 1 : 0
   name              = "/aws/vpc/ood-${var.environment}/flow-logs"
   retention_in_days = local.log_retention
+  kms_key_id        = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
 }
 
 resource "aws_iam_role" "flow_log" {
@@ -1662,7 +1788,11 @@ resource "aws_iam_role_policy" "flow_log" {
         "logs:DescribeLogGroups",
         "logs:DescribeLogStreams",
       ]
-      Resource = "*"
+      # Scoped to the OOD flow log group only (H3)
+      Resource = [
+        aws_cloudwatch_log_group.flow_log[0].arn,
+        "${aws_cloudwatch_log_group.flow_log[0].arn}:*",
+      ]
     }]
   })
 }
@@ -1705,6 +1835,45 @@ resource "aws_s3_bucket_versioning" "cloudtrail" {
   versioning_configuration {
     status = "Enabled"
   }
+}
+
+# CloudTrail bucket public access block (M1)
+resource "aws_s3_bucket_public_access_block" "cloudtrail" {
+  count                   = var.enable_compliance_logging ? 1 : 0
+  bucket                  = aws_s3_bucket.cloudtrail[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# CloudTrail bucket access logging (M2) — audit trail for the audit trail
+resource "aws_s3_bucket" "cloudtrail_logs" {
+  count         = var.enable_compliance_logging ? 1 : 0
+  bucket_prefix = "ood-cloudtrail-logs-${var.environment}-"
+  tags          = { Name = "ood-cloudtrail-logs-${var.environment}" }
+}
+
+resource "aws_s3_bucket_public_access_block" "cloudtrail_logs" {
+  count                   = var.enable_compliance_logging ? 1 : 0
+  bucket                  = aws_s3_bucket.cloudtrail_logs[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_ownership_controls" "cloudtrail_logs" {
+  count  = var.enable_compliance_logging ? 1 : 0
+  bucket = aws_s3_bucket.cloudtrail_logs[0].id
+  rule { object_ownership = "BucketOwnerPreferred" }
+}
+
+resource "aws_s3_bucket_logging" "cloudtrail" {
+  count         = var.enable_compliance_logging ? 1 : 0
+  bucket        = aws_s3_bucket.cloudtrail[0].id
+  target_bucket = aws_s3_bucket.cloudtrail_logs[0].id
+  target_prefix = "access-logs/"
 }
 
 resource "aws_s3_bucket_policy" "cloudtrail" {
@@ -1783,13 +1952,14 @@ resource "aws_backup_plan" "ood" {
 }
 
 resource "aws_backup_selection" "ood" {
-  count        = var.enable_backup && var.enable_efs ? 1 : 0
+  # Create backup selection whenever backup is enabled and there is at least one resource to back up (M5)
+  count        = var.enable_backup && (var.enable_efs || var.enable_dynamodb_uid) ? 1 : 0
   iam_role_arn = aws_iam_role.backup[0].arn
   name         = "ood-${var.environment}"
   plan_id      = aws_backup_plan.ood[0].id
 
   resources = concat(
-    [aws_efs_file_system.home[0].arn],
+    var.enable_efs ? [aws_efs_file_system.home[0].arn] : [],
     var.enable_dynamodb_uid ? [aws_dynamodb_table.uid_map[0].arn] : [],
   )
 }
@@ -1809,12 +1979,30 @@ resource "aws_kms_key" "ood" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "RootAccess"
+        # Root can manage the key (IAM delegation, grants, policy updates) but not use it for data operations (M4)
+        Sid    = "RootKeyAdministration"
         Effect = "Allow"
         Principal = {
           AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
         }
-        Action   = "kms:*"
+        Action = [
+          "kms:Create*",
+          "kms:Describe*",
+          "kms:Enable*",
+          "kms:List*",
+          "kms:Put*",
+          "kms:Update*",
+          "kms:Revoke*",
+          "kms:Disable*",
+          "kms:Get*",
+          "kms:Delete*",
+          "kms:TagResource",
+          "kms:UntagResource",
+          "kms:ScheduleKeyDeletion",
+          "kms:CancelKeyDeletion",
+          "kms:CreateGrant",
+          "kms:RetireGrant",
+        ]
         Resource = "*"
       },
       {

@@ -252,6 +252,12 @@ variable "enable_parameter_store" {
 # Sizing overrides (normally controlled by environment)
 # ---------------------------------------------------------------------------
 
+variable "spot_max_price" {
+  type        = string
+  default     = ""
+  description = "Max hourly price for Spot instances (empty = on-demand price as ceiling). Only applies when deployment_profile=spot."
+}
+
 variable "ebs_volume_size" {
   type        = number
   default     = 0

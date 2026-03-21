@@ -856,9 +856,15 @@ export class OodStack extends cdk.Stack {
     }
 
     // --- CloudFront CDN ---
+    // M7: CloudFront WAF requires scope=CLOUDFRONT deployed in us-east-1.
+    // Pass an existing WAF ACL ARN via context: -c cloudfrontWafArn=arn:aws:wafv2:us-east-1:...
+    const cloudfrontWafArn: string =
+      this.node.tryGetContext("cloudfrontWafArn") || "";
+
     if (enableCdn && alb) {
       new cloudfront.Distribution(this, "Cdn", {
         comment: `OOD ${props.environment} CDN`,
+        webAclId: cloudfrontWafArn || undefined,
         defaultBehavior: {
           origin: new cforigins.LoadBalancerV2Origin(alb, {
             protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,

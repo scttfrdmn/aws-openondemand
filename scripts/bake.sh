@@ -48,7 +48,10 @@ systemctl enable fail2ban
 ###############################################################################
 # Install the OOD release package which configures the OOD yum repo
 ONDEMAND_RELEASE_URL="https://yum.osc.edu/ondemand/4.0/ondemand-release-web-4.0-1.amzn2023.noarch.rpm"
-dnf -y install "${ONDEMAND_RELEASE_URL}"
+dnf -y install --setopt=gpgcheck=1 "${ONDEMAND_RELEASE_URL}" || {
+  echo "ERROR: Failed to verify RPM GPG signature or install OOD release RPM"
+  exit 1
+}
 
 dnf -y install ondemand-4.0.10
 
@@ -68,10 +71,19 @@ chmod 755 /var/log/ood
 # 4. oidc-pam — OIDC → PAM bridge for cloud-native Unix identity
 ###############################################################################
 # Download the latest release binary from github.com/scttfrdmn/oidc-pam
-OIDC_PAM_VERSION=$(curl -fsSL \
-  https://api.github.com/repos/scttfrdmn/oidc-pam/releases/latest \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null \
-  || echo "latest")
+# Pin to a specific release tag for reproducible AMI builds.
+# Override at packer build time: packer build -var oidc_pam_version=v1.2.3
+OIDC_PAM_VERSION="${OIDC_PAM_VERSION:-}"
+if [ -z "${OIDC_PAM_VERSION}" ]; then
+  OIDC_PAM_VERSION=$(curl -fsSL \
+    https://api.github.com/repos/scttfrdmn/oidc-pam/releases/latest \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null \
+    || echo "")
+fi
+if [ -z "${OIDC_PAM_VERSION}" ]; then
+  echo "ERROR: Cannot determine oidc-pam version — set OIDC_PAM_VERSION env var or ensure GitHub API is reachable"
+  exit 1
+fi
 
 ARCH=$(uname -m)
 if [ "${ARCH}" = "x86_64" ]; then
@@ -100,11 +112,18 @@ if curl -fsSL --head "${OIDC_PAM_TGZ_URL}" 2>/dev/null | grep -q "200\|302"; the
     fi
     echo "oidc-pam checksum verified: ${ACTUAL}"
   else
-    echo "WARNING: checksums.txt not available — skipping checksum verification"
+    echo "ERROR: checksums.txt unavailable — aborting for supply chain safety"
+    rm -rf "${TMPDIR}"
+    exit 1
   fi
   tar -xz -C /usr/local/bin/ -f "${TGZ}"
   rm -rf "${TMPDIR}"
   chmod 755 /usr/local/bin/oidc-pam /usr/local/bin/oidc-auth-broker 2>/dev/null || true
+  # Verify extraction succeeded
+  if [ ! -f /usr/local/bin/oidc-pam ] || [ ! -x /usr/local/bin/oidc-pam ]; then
+    echo "ERROR: oidc-pam binary missing or not executable after extraction"
+    exit 1
+  fi
   echo "=== oidc-pam ${OIDC_PAM_VERSION} installed ==="
 else
   echo "WARNING: oidc-pam binary not available at ${OIDC_PAM_TGZ_URL} — skipping"
