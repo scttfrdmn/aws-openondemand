@@ -22,12 +22,24 @@ variable "subnet_id" {
   default = ""
 }
 
+variable "ood_version" {
+  type    = string
+  default = ""
+  # M2: must be set to a specific release for reproducible AMI builds.
+  # Pass -var ood_version=4.0.10 in CI/bake pipelines.
+  # bake.sh exits 1 if empty (enforced in the script).
+}
+
 variable "oidc_pam_version" {
   type    = string
   default = ""
-  # L3: must be set to a specific release tag for reproducible AMI builds.
+  # L1/L3: must be set to a specific semantic version tag for reproducible AMI builds.
   # Pass -var oidc_pam_version=v1.2.3 in CI/bake pipelines.
-  # bake.sh will exit 1 if this is empty (enforced in the script).
+  # bake.sh exits 1 if empty; this validation catches malformed tags at packer validate time.
+  validation {
+    condition     = var.oidc_pam_version == "" || can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+", var.oidc_pam_version))
+    error_message = "The oidc_pam_version variable must be a semantic version tag starting with 'v' (e.g. v1.2.3)."
+  }
 }
 
 variable "git_sha" {
@@ -95,6 +107,7 @@ build {
     execute_command = "sudo -E bash '{{.Path}}'"
     environment_vars = [
       "GIT_SHA=${var.git_sha}",
+      "OOD_VERSION=${var.ood_version}",
       "OIDC_PAM_VERSION=${var.oidc_pam_version}",
     ]
   }

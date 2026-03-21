@@ -92,6 +92,16 @@ variable "use_cognito" {
   description = "Provision a Cognito User Pool + App Client for OIDC auth (Level 3 cloud-native)"
 }
 
+variable "cognito_mfa_required" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    When true, set Cognito MFA to REQUIRED (ON) instead of OPTIONAL.
+    Recommended for prod after all users have enrolled TOTP.
+    Set cognito_mfa_required=true in prod.tfvars once MFA enrollment is complete.
+  EOT
+}
+
 variable "cognito_saml_metadata_url" {
   type        = string
   default     = ""

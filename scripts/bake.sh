@@ -53,9 +53,16 @@ dnf -y install --setopt=gpgcheck=1 "${ONDEMAND_RELEASE_URL}" || {
   exit 1
 }
 
-# I5: Pin OOD version via env var for reproducible builds. Override at bake time:
-#     packer build -var ood_version=4.1.0 (or set OOD_VERSION env var)
-OOD_VERSION="${OOD_VERSION:-4.0.10}"
+# M2: OOD_VERSION must be set explicitly — auto-detecting or defaulting to a mutable
+# version produces non-reproducible AMIs. Two Packer runs from the same git SHA must
+# install the exact same OOD binary. Pin in CI:
+#   packer build -var ood_version=4.0.10 -var oidc_pam_version=v1.2.3 packer/ood.pkr.hcl
+if [ -z "${OOD_VERSION:-}" ]; then
+  echo "ERROR: OOD_VERSION is not set."
+  echo "       Pin to a specific release for reproducible AMI builds:"
+  echo "         packer build -var ood_version=4.0.10 packer/ood.pkr.hcl"
+  exit 1
+fi
 dnf -y install "ondemand-${OOD_VERSION}"
 
 # Enable OOD services (OOD 4.x on AL2023 uses httpd.service with drop-in configs)

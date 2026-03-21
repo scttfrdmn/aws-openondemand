@@ -584,12 +584,28 @@ resource "aws_iam_role_policy" "ec2_adapter" {
         Resource  = "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*"
         Condition = { StringEquals = { "ec2:ResourceTag/Project" = "aws-openondemand" } }
       },
+
       {
         # Describe actions require Resource="*"
         Effect   = "Allow"
         Action   = ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus"]
         Resource = "*"
-      }
+      },
+      {
+        # H4: Belt-and-suspenders Deny for cross-account AMI launches.
+        # The Allow statement above requires ec2:Owner = this account, but an explicit
+        # Deny ensures a permissive policy elsewhere cannot override the Allow condition.
+        Effect = "Deny"
+        Action = ["ec2:RunInstances"]
+        Resource = [
+          "arn:aws:ec2:${var.aws_region}::image/*",
+        ]
+        Condition = {
+          StringNotEquals = {
+            "ec2:Owner" = data.aws_caller_identity.current.account_id
+          }
+        }
+      },
     ]
   })
 }
@@ -613,9 +629,10 @@ resource "aws_cognito_user_pool" "ood" {
     temporary_password_validity_days = 7
   }
 
-  # M5: enable software TOTP MFA — optional so existing users without MFA can
-  # still authenticate; recommend REQUIRED for prod after initial rollout
-  mfa_configuration = "OPTIONAL"
+  # H2: TOTP MFA — OPTIONAL during rollout so existing users are not locked out.
+  # Set cognito_mfa_required=true in prod.tfvars once all users have enrolled.
+  # A lifecycle precondition below warns operators that prod should enforce MFA.
+  mfa_configuration = var.cognito_mfa_required ? "ON" : "OPTIONAL"
   software_token_mfa_configuration {
     enabled = true
   }
@@ -633,6 +650,14 @@ resource "aws_cognito_user_pool" "ood" {
 
   lifecycle {
     prevent_destroy = true # M10: user pool contains identity mappings; accidental destroy loses all users
+
+    # H2: production portals must enforce MFA — a compromised password alone would grant
+    # full portal access including compute submission and EFS home directory reads.
+    # Set cognito_mfa_required=true in prod.tfvars after users have enrolled TOTP.
+    precondition {
+      condition     = var.environment != "prod" || var.cognito_mfa_required
+      error_message = "Production Cognito deployments require cognito_mfa_required=true. Set this in prod.tfvars after users complete TOTP enrollment to enforce MFA for all logins."
+    }
   }
 }
 
@@ -1035,6 +1060,27 @@ resource "aws_secretsmanager_secret_rotation" "oidc_client_secret" {
       condition     = var.environment != "prod" || var.oidc_secret_rotation_lambda_arn != ""
       error_message = "Production deployments require oidc_secret_rotation_lambda_arn to enable automatic OIDC secret rotation. Manual rotation every 90 days is not acceptable for prod."
     }
+  }
+}
+
+# H3: Alert when Secrets Manager rotation fails — a failed rotation means the OIDC
+# secret will expire at the end of the current rotation window, causing all logins to
+# fail. Operators must investigate and re-trigger rotation before the expiry deadline.
+resource "aws_cloudwatch_metric_alarm" "oidc_rotation_failure" {
+  count               = var.use_cognito && var.enable_monitoring && var.oidc_secret_rotation_lambda_arn != "" ? 1 : 0
+  alarm_name          = "ood-${var.environment}-oidc-rotation-failure"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "RotationFailed"
+  namespace           = "AWS/SecretsManager"
+  period              = 3600
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching" # No rotation activity = healthy; rotation failure is an event
+  alarm_description   = "OIDC client secret rotation failed — the secret will expire in <90 days causing all portal logins to fail. Investigate the rotation Lambda and re-trigger: aws secretsmanager rotate-secret --secret-id ${aws_secretsmanager_secret.oidc_client_secret[0].id}"
+  alarm_actions       = [aws_sns_topic.ood[0].arn]
+  dimensions = {
+    SecretId = aws_secretsmanager_secret.oidc_client_secret[0].id
   }
 }
 
@@ -1601,6 +1647,48 @@ resource "aws_vpc_endpoint" "s3" {
   tags = { Name = "ood-s3-endpoint-${var.environment}" }
 }
 
+# C1: Scope S3 gateway endpoint so only the OOD instance role can use it.
+# Without a policy, the default allows Principal:* / Action:s3:* — any workload
+# in the VPC can reach any S3 bucket via this endpoint without further IAM checks.
+# The second statement permits read-only access to AWS-managed service buckets
+# (AL2023 yum repos, SSM agent, CWAgent) which the instance accesses without
+# explicit IAM credentials through the OS package manager.
+resource "aws_vpc_endpoint_policy" "s3" {
+  count           = var.enable_vpc_endpoints ? 1 : 0
+  vpc_endpoint_id = aws_vpc_endpoint.s3[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowOODInstanceRole"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.ood.arn }
+        Action    = "s3:*"
+        Resource  = "*"
+      },
+      {
+        # Allow read from AWS-managed service buckets used by yum/dnf, SSM agent,
+        # and CWAgent installer on AL2023. These requests originate from the OS
+        # without the instance IAM role attached to the HTTP request.
+        Sid       = "AllowAWSServiceBuckets"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = ["s3:GetObject", "s3:ListBucket"]
+        Resource = [
+          "arn:aws:s3:::amazonlinux*",
+          "arn:aws:s3:::amazonlinux*/*",
+          "arn:aws:s3:::aws-ssm-${var.aws_region}",
+          "arn:aws:s3:::aws-ssm-${var.aws_region}/*",
+          "arn:aws:s3:::amazon-ssm-${var.aws_region}",
+          "arn:aws:s3:::amazon-ssm-${var.aws_region}/*",
+          "arn:aws:s3:::patch-baseline-snapshot-${var.aws_region}",
+          "arn:aws:s3:::patch-baseline-snapshot-${var.aws_region}/*",
+        ]
+      },
+    ]
+  })
+}
+
 resource "aws_security_group" "vpc_endpoints" {
   count       = var.enable_vpc_endpoints ? 1 : 0
   name_prefix = "ood-vpce-${var.environment}-"
@@ -1644,6 +1732,120 @@ resource "aws_vpc_endpoint" "interfaces" {
   private_dns_enabled = true
 
   tags = { Name = "ood-${each.key}-endpoint-${var.environment}" }
+}
+
+# H1: Scope interface endpoint policies so only the OOD instance role can use each endpoint.
+# Secrets Manager policy also allows the rotation Lambda ARN when configured.
+# ssmmessages and ec2messages require a broader action set for SSM Session Manager to work.
+
+resource "aws_vpc_endpoint_policy" "secretsmanager" {
+  count           = var.enable_vpc_endpoints && var.use_cognito ? 1 : 0
+  vpc_endpoint_id = aws_vpc_endpoint.interfaces["secretsmanager"].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowOODSecretAccess"
+      Effect    = "Allow"
+      Principal = { AWS = aws_iam_role.ood.arn }
+      Action    = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+      Resource  = aws_secretsmanager_secret.oidc_client_secret[0].arn
+    }]
+  })
+}
+
+resource "aws_vpc_endpoint_policy" "ssm" {
+  count           = var.enable_vpc_endpoints ? 1 : 0
+  vpc_endpoint_id = aws_vpc_endpoint.interfaces["ssm"].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowOODSSMAccess"
+      Effect    = "Allow"
+      Principal = { AWS = aws_iam_role.ood.arn }
+      Action = [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+        "ssm:DescribeParameters",
+        "ssm:StartSession",
+        "ssm:TerminateSession",
+        "ssm:DescribeSessions",
+        "ssm:GetConnectionStatus",
+        "ssm:DescribeInstanceInformation",
+        "ssm:UpdateInstanceInformation",
+        "ssm:SendCommand",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_vpc_endpoint_policy" "ssmmessages" {
+  count           = var.enable_vpc_endpoints ? 1 : 0
+  vpc_endpoint_id = aws_vpc_endpoint.interfaces["ssmmessages"].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowOODSSMMessages"
+      Effect    = "Allow"
+      Principal = { AWS = aws_iam_role.ood.arn }
+      Action = [
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_vpc_endpoint_policy" "ec2messages" {
+  count           = var.enable_vpc_endpoints ? 1 : 0
+  vpc_endpoint_id = aws_vpc_endpoint.interfaces["ec2messages"].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowOODEC2Messages"
+      Effect    = "Allow"
+      Principal = { AWS = aws_iam_role.ood.arn }
+      Action = [
+        "ec2messages:AcknowledgeMessage",
+        "ec2messages:DeleteMessage",
+        "ec2messages:FailMessage",
+        "ec2messages:GetEndpoint",
+        "ec2messages:GetMessages",
+        "ec2messages:SendReply",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_vpc_endpoint_policy" "logs" {
+  count           = var.enable_vpc_endpoints ? 1 : 0
+  vpc_endpoint_id = aws_vpc_endpoint.interfaces["logs"].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowOODCloudWatchLogs"
+      Effect    = "Allow"
+      Principal = { AWS = aws_iam_role.ood.arn }
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams",
+        "logs:DescribeLogGroups",
+      ]
+      Resource = [
+        "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/ood-${var.environment}",
+        "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/ood-${var.environment}:*",
+        "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ssm/ood-${var.environment}*",
+        "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ssm/ood-${var.environment}*:*",
+      ]
+    }]
+  })
 }
 
 # ---------------------------------------------------------------------------
@@ -1777,11 +1979,14 @@ resource "aws_cloudfront_distribution" "ood" {
 # ---------------------------------------------------------------------------
 # CloudWatch — log groups, dashboard, alarms
 # ---------------------------------------------------------------------------
+# M3: Bootstrap log group is always created regardless of enable_monitoring.
+# userdata.sh writes to this log group on every boot — if the group doesn't exist,
+# the CWAgent fails silently and bootstrap failures become invisible.
+# This is the minimum audit trail needed to diagnose a broken deployment.
 resource "aws_cloudwatch_log_group" "bootstrap" {
-  count             = var.enable_monitoring ? 1 : 0
   name              = "/aws/ec2/ood-${var.environment}/bootstrap"
   retention_in_days = local.log_retention
-  kms_key_id        = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null # M4
+  kms_key_id        = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
 }
 
 resource "aws_cloudwatch_log_group" "nginx_access" {
@@ -2142,6 +2347,31 @@ resource "aws_iam_role_policy_attachment" "batch_job_ecs" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# M1: Create the Spot Fleet IAM role used by AWS Batch instead of assuming it exists.
+# Previously this referenced a pre-existing role by hardcoded ARN; if absent, Batch
+# silently fails to launch Spot instances with an opaque error.
+resource "aws_iam_role" "batch_spot_fleet" {
+  count       = local.enable_batch ? 1 : 0
+  name_prefix = "ood-batch-spot-fleet-${var.environment}-"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "spotfleet.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+
+  tags = { Name = "ood-batch-spot-fleet-${var.environment}" }
+}
+
+resource "aws_iam_role_policy_attachment" "batch_spot_fleet" {
+  count      = local.enable_batch ? 1 : 0
+  role       = aws_iam_role.batch_spot_fleet[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole"
+}
+
 resource "aws_batch_compute_environment" "ood" {
   count                    = local.enable_batch ? 1 : 0
   compute_environment_name = "ood-${var.environment}"
@@ -2154,10 +2384,10 @@ resource "aws_batch_compute_environment" "ood" {
     min_vcpus           = 0
     max_vcpus           = 256
     instance_role       = aws_iam_instance_profile.ood.arn
-    instance_type       = ["optimal"]
+    instance_type       = ["m5", "m5a", "m6i"] # Explicit families avoid "optimal" picking GPU/storage instances
     subnets             = local.private_subnets
     security_group_ids  = [aws_security_group.ood.id]
-    spot_iam_fleet_role = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/AmazonEC2SpotFleetRole"
+    spot_iam_fleet_role = aws_iam_role.batch_spot_fleet[0].arn
   }
 
   lifecycle {

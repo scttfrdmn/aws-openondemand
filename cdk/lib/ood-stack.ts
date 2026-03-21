@@ -159,6 +159,16 @@ export class OodStack extends cdk.Stack {
       this.node.tryGetContext("alarmEmail") || "";
     const adaptersEnabled: string[] =
       this.node.tryGetContext("adaptersEnabled") || [];
+    // H2: cognito_mfa_required=true sets MFA to REQUIRED (ON) instead of OPTIONAL.
+    // Set this in cdk.context.json for prod once all users have enrolled TOTP.
+    const cognitoMfaRequired =
+      this.node.tryGetContext("cognitoMfaRequired") === "true";
+    if (props.environment === "prod" && useCognito && !cognitoMfaRequired) {
+      throw new Error(
+        "Production Cognito deployments require cognitoMfaRequired=true. " +
+          "Set this in cdk.context.json after users complete TOTP enrollment."
+      );
+    }
     const logGroupPrefix = `/aws/ec2/ood-${props.environment}`;
 
     // Spot precondition
@@ -266,9 +276,10 @@ export class OodStack extends cdk.Stack {
           requireDigits: true,
           requireSymbols: true,
         },
-        // M5: TOTP MFA — OPTIONAL allows existing users to authenticate while
-        // encouraging enrollment; flip to REQUIRED after initial rollout
-        mfa: cognito.Mfa.OPTIONAL,
+        // H2: MFA driven by cognitoMfaRequired context — OPTIONAL during rollout,
+        // REQUIRED (ON) once all users have enrolled TOTP. Prod throws at synth time
+        // if cognitoMfaRequired is not set (enforced above).
+        mfa: cognitoMfaRequired ? cognito.Mfa.REQUIRED : cognito.Mfa.OPTIONAL,
         mfaSecondFactor: { otp: true, sms: false },
         accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
         removalPolicy: cdk.RemovalPolicy.RETAIN, // M10: always RETAIN — pool contains all user identities
