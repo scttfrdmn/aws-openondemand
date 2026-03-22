@@ -114,3 +114,15 @@ output "oidc_client_secret_arn" {
   value     = var.use_cognito ? aws_secretsmanager_secret.oidc_client_secret[0].arn : ""
   sensitive = true
 }
+
+output "emr_application_id" {
+  description = "EMR Serverless application ID (empty if EMR adapter not enabled)"
+  value       = local.enable_emr ? aws_emrserverless_application.ood[0].id : ""
+  sensitive   = true # M7
+}
+
+output "ecs_cluster_arn" {
+  description = "ECS cluster ARN for Fargate workloads (empty if Fargate adapter not enabled)"
+  value       = local.enable_fargate ? aws_ecs_cluster.ood[0].arn : ""
+  sensitive   = true # M7
+}

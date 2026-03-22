@@ -63,9 +63,14 @@ locals {
   alb_subnets = length(var.alb_subnet_ids) > 0 ? var.alb_subnet_ids : [var.subnet_id]
 
   # Adapter flags
-  enable_batch       = contains(var.adapters_enabled, "batch")
-  enable_sagemaker   = contains(var.adapters_enabled, "sagemaker")
-  enable_ec2_adapter = contains(var.adapters_enabled, "ec2")
+  enable_batch              = contains(var.adapters_enabled, "batch")
+  enable_sagemaker          = contains(var.adapters_enabled, "sagemaker")
+  enable_ec2_adapter        = contains(var.adapters_enabled, "ec2")
+  enable_omics              = contains(var.adapters_enabled, "omics")
+  enable_emr                = contains(var.adapters_enabled, "emr")
+  enable_sagemaker_training = contains(var.adapters_enabled, "sagemaker-training")
+  enable_fargate            = contains(var.adapters_enabled, "fargate")
+  enable_stepfunctions      = contains(var.adapters_enabled, "stepfunctions")
 
   # Precondition: spot profile requires cloud-native stack
   # (enforced below via lifecycle precondition on the ASG)
@@ -2551,6 +2556,197 @@ resource "aws_sagemaker_user_profile" "ood_default" {
   user_settings {
     execution_role = aws_iam_role.sagemaker_execution[0].arn
   }
+}
+
+# ---------------------------------------------------------------------------
+# HealthOmics adapter (conditional on adapters_enabled containing "omics")
+# ---------------------------------------------------------------------------
+resource "aws_iam_role_policy" "omics_adapter" {
+  count       = local.enable_omics ? 1 : 0
+  name_prefix = "ood-omics-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["omics:StartRun", "omics:GetRun", "omics:CancelRun", "omics:ListRuns"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "omics.amazonaws.com" }
+        }
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# EMR Serverless adapter (conditional on adapters_enabled containing "emr")
+# ---------------------------------------------------------------------------
+resource "aws_emrserverless_application" "ood" {
+  count         = local.enable_emr ? 1 : 0
+  name          = "ood-${var.environment}"
+  release_label = "emr-7.0.0"
+  type          = "spark"
+
+  tags = {
+    Name = "ood-emr-${var.environment}"
+  }
+}
+
+resource "aws_ssm_parameter" "emr_application_id" {
+  count = local.enable_emr ? 1 : 0
+  name  = "/ood/${var.environment}/emr_application_id"
+  type  = "String"
+  value = aws_emrserverless_application.ood[0].id
+}
+
+resource "aws_iam_role_policy" "emr_adapter" {
+  count       = local.enable_emr ? 1 : 0
+  name_prefix = "ood-emr-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "emr-serverless:StartJobRun",
+          "emr-serverless:GetJobRun",
+          "emr-serverless:CancelJobRun",
+          "emr-serverless:ListJobRuns",
+        ]
+        Resource = [
+          aws_emrserverless_application.ood[0].arn,
+          "${aws_emrserverless_application.ood[0].arn}/jobruns/*",
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "emr-serverless.amazonaws.com" }
+        }
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# SageMaker Training adapter (conditional on adapters_enabled containing "sagemaker-training")
+# ---------------------------------------------------------------------------
+resource "aws_iam_role_policy" "sagemaker_training_adapter" {
+  count       = local.enable_sagemaker_training ? 1 : 0
+  name_prefix = "ood-sagemaker-training-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sagemaker:CreateTrainingJob",
+          "sagemaker:DescribeTrainingJob",
+          "sagemaker:StopTrainingJob",
+          "sagemaker:ListTrainingJobs",
+        ]
+        Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:training-job/ood-*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "sagemaker.amazonaws.com" }
+        }
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Fargate adapter (conditional on adapters_enabled containing "fargate")
+# ---------------------------------------------------------------------------
+resource "aws_ecs_cluster" "ood" {
+  count = local.enable_fargate ? 1 : 0
+  name  = "ood-${var.environment}"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
+  tags = {
+    Name = "ood-fargate-${var.environment}"
+  }
+}
+
+resource "aws_iam_role_policy" "fargate_adapter" {
+  count       = local.enable_fargate ? 1 : 0
+  name_prefix = "ood-fargate-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["ecs:RunTask", "ecs:StopTask", "ecs:ListTasks"]
+        Resource = [
+          aws_ecs_cluster.ood[0].arn,
+          "${aws_ecs_cluster.ood[0].arn}/task/*",
+          "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/*",
+        ]
+      },
+      {
+        # DescribeTasks requires Resource="*"
+        Effect   = "Allow"
+        Action   = ["ecs:DescribeTasks"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" }
+        }
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Step Functions adapter (conditional on adapters_enabled containing "stepfunctions")
+# ---------------------------------------------------------------------------
+resource "aws_iam_role_policy" "stepfunctions_adapter" {
+  count       = local.enable_stepfunctions ? 1 : 0
+  name_prefix = "ood-stepfunctions-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["states:StartExecution", "states:StopExecution", "states:ListExecutions"]
+        Resource = [
+          "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:stateMachine:ood-*",
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = ["states:DescribeExecution"]
+        Resource = [
+          "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:execution:ood-*:*",
+        ]
+      },
+    ]
+  })
 }
 
 # ---------------------------------------------------------------------------

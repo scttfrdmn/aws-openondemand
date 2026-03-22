@@ -302,6 +302,125 @@ v2:
 EC2CONF
 fi
 
+# HealthOmics adapter cluster config
+if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('omics' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
+  echo "=== Configuring HealthOmics cluster ==="
+  cat > /etc/ood/config/clusters.d/aws-omics.yml <<OMICSCONF
+---
+v2:
+  metadata:
+    title: "AWS HealthOmics"
+    hidden: false
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/lib/ood-adapters/ood-omics-adapter"
+      args:
+        - submit
+        - "--region=${AWS_REGION}"
+OMICSCONF
+fi
+
+# EMR Serverless adapter cluster config
+if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('emr' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
+  echo "=== Configuring EMR Serverless cluster ==="
+  EMR_APP_ID=$(aws ssm get-parameter \
+    --region "${AWS_REGION}" \
+    --name "/ood/${OOD_ENVIRONMENT}/emr_application_id" \
+    --query 'Parameter.Value' \
+    --output text 2>/dev/null || echo "")
+
+  cat > /etc/ood/config/clusters.d/aws-emr.yml <<EMRCONF
+---
+v2:
+  metadata:
+    title: "Amazon EMR Serverless"
+    hidden: false
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/lib/ood-adapters/ood-emr-adapter"
+      args:
+        - submit
+        - "--application-id=${EMR_APP_ID}"
+        - "--region=${AWS_REGION}"
+EMRCONF
+fi
+
+# SageMaker Training adapter cluster config
+if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('sagemaker-training' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
+  echo "=== Configuring SageMaker Training cluster ==="
+  cat > /etc/ood/config/clusters.d/aws-sagemaker-training.yml <<SMTRAINCONF
+---
+v2:
+  metadata:
+    title: "AWS SageMaker Training"
+    hidden: false
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/lib/ood-adapters/ood-sagemaker-training-adapter"
+      args:
+        - submit
+        - "--region=${AWS_REGION}"
+SMTRAINCONF
+fi
+
+# Fargate adapter cluster config
+if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('fargate' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
+  echo "=== Configuring Fargate cluster ==="
+  ECS_CLUSTER_ARN=$(aws ecs list-clusters \
+    --region "${AWS_REGION}" \
+    --query "clusterArns[?contains(@, 'ood-fargate-${OOD_ENVIRONMENT}')]" \
+    --output text 2>/dev/null | head -1 || echo "")
+  if [ -z "${ECS_CLUSTER_ARN}" ]; then
+    ECS_CLUSTER_ARN=$(aws ecs list-clusters \
+      --region "${AWS_REGION}" \
+      --query "clusterArns[?contains(@, 'ood-${OOD_ENVIRONMENT}')]" \
+      --output text 2>/dev/null | head -1 || echo "")
+  fi
+
+  cat > /etc/ood/config/clusters.d/aws-fargate.yml <<FARGATECONF
+---
+v2:
+  metadata:
+    title: "AWS Fargate"
+    hidden: false
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/lib/ood-adapters/ood-fargate-adapter"
+      args:
+        - submit
+        - "--cluster=${ECS_CLUSTER_ARN}"
+        - "--region=${AWS_REGION}"
+FARGATECONF
+fi
+
+# Step Functions adapter cluster config
+if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('stepfunctions' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
+  echo "=== Configuring Step Functions cluster ==="
+  cat > /etc/ood/config/clusters.d/aws-stepfunctions.yml <<SFNCONF
+---
+v2:
+  metadata:
+    title: "AWS Step Functions"
+    hidden: false
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/lib/ood-adapters/ood-stepfunctions-adapter"
+      args:
+        - submit
+        - "--region=${AWS_REGION}"
+SFNCONF
+fi
+
 ###############################################################################
 # 6. Configure PUN session cache (ElastiCache Redis, Level 5)
 ###############################################################################
