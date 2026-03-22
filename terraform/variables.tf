@@ -275,6 +275,10 @@ variable "oidc_secret_rotation_lambda_arn" {
   type        = string
   default     = ""
   description = "ARN of a Lambda function to rotate the Cognito OIDC client secret. Empty = no automatic rotation (manual rotation required every 90 days)."
+  validation {
+    condition     = var.oidc_secret_rotation_lambda_arn == "" || can(regex("^arn:aws[a-z-]*:lambda:[a-z0-9-]+:[0-9]{12}:function:", var.oidc_secret_rotation_lambda_arn))
+    error_message = "oidc_secret_rotation_lambda_arn must be a valid Lambda function ARN (arn:aws[...]:lambda:<region>:<account>:function:<name>)."
+  }
 }
 
 # ---------------------------------------------------------------------------

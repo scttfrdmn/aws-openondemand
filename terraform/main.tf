@@ -549,6 +549,9 @@ resource "aws_iam_role_policy" "ec2_adapter" {
     Version = "2012-10-17"
     Statement = [
       {
+        # N3: ec2:Vpc condition restricts subnet and security-group resources to the OOD
+        # VPC, preventing the EC2 adapter from launching instances into uncontrolled VPCs
+        # or attaching security groups from other networks in the same account.
         Effect = "Allow"
         Action = ["ec2:RunInstances"]
         Resource = [
@@ -558,7 +561,10 @@ resource "aws_iam_role_policy" "ec2_adapter" {
           "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:network-interface/*",
           "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/*",
         ]
-        Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }
+        Condition = {
+          StringEquals = { "aws:RequestedRegion" = var.aws_region }
+          ArnLike      = { "ec2:Vpc" = "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:vpc/${data.aws_vpc.selected.id}" }
+        }
       },
       {
         # RunInstances on images: restrict to AMIs tagged as OOD project AND owned by this account.
@@ -823,6 +829,12 @@ resource "aws_elasticache_subnet_group" "ood" {
   subnet_ids = local.private_subnets
 }
 
+# N3: Redis auth token compromise is mitigated at two independent layers:
+#   1. Network: ElastiCache is in private subnets; aws_security_group.elasticache allows
+#      inbound 6379 only from aws_security_group.ood — no internet path exists.
+#   2. Credential: auth_token is a 64-char random secret stored in Secrets Manager /
+#      SSM SecureString; only the OOD instance role can retrieve it.
+# Even if the token were exfiltrated, an attacker still needs network access to port 6379.
 resource "aws_elasticache_replication_group" "ood" {
   count                      = var.enable_session_cache ? 1 : 0
   replication_group_id       = "ood-${var.environment}"
@@ -1027,7 +1039,7 @@ resource "aws_ssm_parameter" "oidc_client_id" {
 resource "aws_secretsmanager_secret" "oidc_client_secret" {
   count                   = var.use_cognito ? 1 : 0
   name                    = "ood/${var.environment}/oidc-client-secret"
-  recovery_window_in_days = var.environment == "prod" ? 30 : 7
+  recovery_window_in_days = var.environment == "prod" ? 30 : (var.environment == "staging" ? 14 : 7) # N5: staging gets 14d; test keeps 7d
   kms_key_id              = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
 
   tags = { Name = "ood-oidc-secret-${var.environment}" }
@@ -1273,6 +1285,11 @@ resource "aws_iam_role_policy_attachment" "dlm" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
 }
 
+# N2: DLM snapshots automatically inherit the encryption state of the source EBS volume.
+# When enable_kms_cmk=true, the launch template uses aws_kms_key.ood[0] for the root
+# volume — snapshots created by this policy will be encrypted with that same CMK.
+# When enable_kms_cmk=false, volumes use the default aws/ebs managed key and snapshots
+# inherit that key. Snapshots are NEVER unencrypted regardless of this policy configuration.
 resource "aws_dlm_lifecycle_policy" "ood" {
   description        = "OOD ${var.environment} EBS snapshots"
   execution_role_arn = aws_iam_role.dlm.arn
@@ -1435,11 +1452,12 @@ resource "aws_lb" "ood" {
 }
 
 resource "aws_lb_target_group" "ood" {
-  count       = var.enable_alb ? 1 : 0
-  name_prefix = "ood-"
-  port        = 80
-  protocol    = "HTTP"
-  vpc_id      = data.aws_vpc.selected.id
+  count                = var.enable_alb ? 1 : 0
+  name_prefix          = "ood-"
+  port                 = 80
+  protocol             = "HTTP"
+  vpc_id               = data.aws_vpc.selected.id
+  deregistration_delay = 30 # N4: 30s is sufficient for OOD dashboard requests; default 300s delays ASG instance replacement unnecessarily
 
   health_check {
     path                = "/pun/sys/dashboard"
@@ -1653,6 +1671,9 @@ resource "aws_vpc_endpoint" "s3" {
 # The second statement permits read-only access to AWS-managed service buckets
 # (AL2023 yum repos, SSM agent, CWAgent) which the instance accesses without
 # explicit IAM credentials through the OS package manager.
+# N1: Resource is scoped to the ood-* bucket prefix (all OOD-created buckets use
+# this prefix). Without bucket scoping, a compromised OOD process could reach any
+# S3 bucket in the account via this private endpoint, bypassing normal egress paths.
 resource "aws_vpc_endpoint_policy" "s3" {
   count           = var.enable_vpc_endpoints ? 1 : 0
   vpc_endpoint_id = aws_vpc_endpoint.s3[0].id
@@ -1664,7 +1685,10 @@ resource "aws_vpc_endpoint_policy" "s3" {
         Effect    = "Allow"
         Principal = { AWS = aws_iam_role.ood.arn }
         Action    = "s3:*"
-        Resource  = "*"
+        Resource = [
+          "arn:aws:s3:::ood-*",
+          "arn:aws:s3:::ood-*/*",
+        ]
       },
       {
         # Allow read from AWS-managed service buckets used by yum/dnf, SSM agent,
@@ -2372,6 +2396,45 @@ resource "aws_iam_role_policy_attachment" "batch_spot_fleet" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole"
 }
 
+# N2: Dedicated minimal instance role for Batch compute nodes.
+# Batch worker instances previously inherited the full OOD portal role — giving
+# every Batch job the ability to read EFS home directories, write DynamoDB UID
+# mappings, read the OIDC client secret, and submit further Batch jobs.
+# Workers only need SSM session access (for troubleshooting) and CloudWatch Logs.
+resource "aws_iam_role" "batch_instance" {
+  count       = local.enable_batch ? 1 : 0
+  name_prefix = "ood-batch-instance-${var.environment}-"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+
+  tags = { Name = "ood-batch-instance-${var.environment}" }
+}
+
+resource "aws_iam_role_policy_attachment" "batch_instance_ssm" {
+  count      = local.enable_batch ? 1 : 0
+  role       = aws_iam_role.batch_instance[0].name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy_attachment" "batch_instance_cw" {
+  count      = local.enable_batch ? 1 : 0
+  role       = aws_iam_role.batch_instance[0].name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+resource "aws_iam_instance_profile" "batch_instance" {
+  count       = local.enable_batch ? 1 : 0
+  name_prefix = "ood-batch-instance-${var.environment}-"
+  role        = aws_iam_role.batch_instance[0].name
+}
+
 resource "aws_batch_compute_environment" "ood" {
   count                    = local.enable_batch ? 1 : 0
   compute_environment_name = "ood-${var.environment}"
@@ -2383,7 +2446,7 @@ resource "aws_batch_compute_environment" "ood" {
     bid_percentage      = 60
     min_vcpus           = 0
     max_vcpus           = 256
-    instance_role       = aws_iam_instance_profile.ood.arn
+    instance_role       = aws_iam_instance_profile.batch_instance[0].arn
     instance_type       = ["m5", "m5a", "m6i"] # Explicit families avoid "optimal" picking GPU/storage instances
     subnets             = local.private_subnets
     security_group_ids  = [aws_security_group.ood.id]
