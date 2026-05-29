@@ -409,6 +409,26 @@ resource "aws_iam_role_policy" "ssm_session_s3" {
   })
 }
 
+# Read access to the bootstrap artifact bucket so the launch-template stub can
+# fetch userdata.sh / bake.sh at boot (#16). Scoped to this bucket only. The CMK
+# decrypt grant (when enable_kms_cmk) is already covered by the EC2Access
+# statement on aws_kms_key.ood, so no extra KMS policy is needed here.
+resource "aws_iam_role_policy" "artifacts_read" {
+  name_prefix = "ood-artifacts-read-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = ["s3:GetObject", "s3:ListBucket"]
+      Resource = [
+        aws_s3_bucket.artifacts.arn,
+        "${aws_s3_bucket.artifacts.arn}/*",
+      ]
+    }]
+  })
+}
+
 # Secrets Manager: fetch OIDC client secret at runtime (H2)
 resource "aws_iam_role_policy" "secrets_manager" {
   count       = var.use_cognito ? 1 : 0
@@ -1022,6 +1042,114 @@ resource "aws_s3_bucket_policy" "ood_files" {
 }
 
 # ---------------------------------------------------------------------------
+# Bootstrap artifact bucket — stages userdata.sh / bake.sh out of user_data
+# ---------------------------------------------------------------------------
+# EC2 user_data has a hard 16,384-byte limit (applied to the base64-encoded
+# value). scripts/userdata.sh alone is ~18 KB, so it cannot be inlined (#16).
+# Instead the launch template carries a tiny stub that fetches the script from
+# this bucket, verifies its SHA256, and execs it. The "ood-" name prefix is
+# REQUIRED: the S3 gateway endpoint policy (aws_vpc_endpoint_policy.s3) scopes
+# reachable buckets to arn:aws:s3:::ood-*, so this delivery path works even in
+# no-egress / VPC-endpoint-only deployments with no NAT or internet route.
+resource "aws_s3_bucket" "artifacts" {
+  bucket_prefix = "ood-artifacts-${var.environment}-"
+
+  tags = {
+    Name = "ood-artifacts-${var.environment}"
+  }
+
+  # Unlike ood_files (which holds user data), these are rebuildable artifacts
+  # re-uploaded from source on every apply — destroy must not be blocked.
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
+resource "aws_s3_bucket_versioning" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = var.enable_kms_cmk ? "aws:kms" : "AES256"
+      kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "artifacts" {
+  bucket                  = aws_s3_bucket.artifacts.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Deny non-TLS access and uploads that opt out of server-side encryption,
+# matching the hardening on the OOD files bucket (H1).
+resource "aws_s3_bucket_policy" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyHTTP"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.artifacts.arn,
+          "${aws_s3_bucket.artifacts.arn}/*",
+        ]
+        Condition = { Bool = { "aws:SecureTransport" = "false" } }
+      },
+      {
+        Sid       = "DenyUnencryptedUploads"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.artifacts.arn}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-server-side-encryption" = "false"
+          }
+        }
+      },
+    ]
+  })
+}
+
+# Stage the bootstrap scripts. source_hash forces a re-upload whenever the local
+# file changes, and filebase64sha256 (computed identically in the launch-template
+# stub) is what the instance verifies the download against at boot.
+resource "aws_s3_object" "userdata" {
+  bucket      = aws_s3_bucket.artifacts.id
+  key         = "userdata.sh"
+  source      = "${path.module}/../scripts/userdata.sh"
+  source_hash = filemd5("${path.module}/../scripts/userdata.sh")
+
+  # Inherit the bucket default encryption; set explicitly so DenyUnencryptedUploads
+  # never rejects the upload.
+  server_side_encryption = var.enable_kms_cmk ? "aws:kms" : "AES256"
+  kms_key_id             = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+}
+
+resource "aws_s3_object" "bake" {
+  bucket      = aws_s3_bucket.artifacts.id
+  key         = "bake.sh"
+  source      = "${path.module}/../scripts/bake.sh"
+  source_hash = filemd5("${path.module}/../scripts/bake.sh")
+
+  server_side_encryption = var.enable_kms_cmk ? "aws:kms" : "AES256"
+  kms_key_id             = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+}
+
+# ---------------------------------------------------------------------------
 # SSM Parameter Store — runtime config for userdata.sh
 # ---------------------------------------------------------------------------
 resource "aws_ssm_parameter" "ood_domain" {
@@ -1197,8 +1325,15 @@ resource "aws_launch_template" "ood" {
     }
   }
 
-  user_data = base64encode(join("\n", [
+  # #16: user_data is a tiny stub — it sets the OOD_* launch-time config, then
+  # fetches the real bootstrap script(s) from the artifact bucket, verifies their
+  # SHA256, and execs them. The 18 KB userdata.sh can no longer be inlined (the
+  # base64-encoded value would exceed EC2's 16,384-byte hard limit). The hashes
+  # below are computed by Terraform from the exact files uploaded to S3, so
+  # verification is intrinsic — there is no separate checksum file to drift.
+  user_data = base64encode(join("\n", concat([
     "#!/usr/bin/env bash",
+    "set -euo pipefail",
     "export OOD_ENVIRONMENT='${var.environment}'",
     "export OOD_ENABLE_PARAMETER_STORE='${tostring(var.enable_parameter_store)}'",
     "export OOD_ENABLE_MONITORING='${tostring(var.enable_monitoring)}'",
@@ -1215,8 +1350,23 @@ resource "aws_launch_template" "ood" {
     "export OOD_ADAPTERS_ENABLED='${jsonencode(var.adapters_enabled)}'",
     "export OOD_LOG_GROUP_PREFIX='/aws/ec2/ood-${var.environment}'",
     "export OOD_DOMAIN='${var.domain_name}'",
-    file("${path.module}/../scripts/userdata.sh")
-  ]))
+    "ARTIFACT_BUCKET='${aws_s3_bucket.artifacts.id}'",
+    ],
+    # bake.sh runs at boot only on the base AL2023 AMI; with a pre-baked AMI it was
+    # already applied at image build time (matches the CDK base-AMI branch).
+    var.enable_packer_ami ? ["# Baked AMI — bake.sh already applied at image build time"] : [
+      "aws s3 cp \"s3://$ARTIFACT_BUCKET/bake.sh\" /tmp/bake.sh --region ${var.aws_region}",
+      "echo '${filesha256("${path.module}/../scripts/bake.sh")}  /tmp/bake.sh' | sha256sum -c -",
+      "bash /tmp/bake.sh",
+      "rm -f /tmp/bake.sh",
+    ],
+    [
+      "aws s3 cp \"s3://$ARTIFACT_BUCKET/userdata.sh\" /tmp/userdata.sh --region ${var.aws_region}",
+      "echo '${filesha256("${path.module}/../scripts/userdata.sh")}  /tmp/userdata.sh' | sha256sum -c -",
+      "bash /tmp/userdata.sh",
+      "rm -f /tmp/userdata.sh",
+    ]
+  )))
 
   tag_specifications {
     resource_type = "instance"
@@ -1238,6 +1388,10 @@ resource "aws_launch_template" "ood" {
       error_message = "spot profile requires enable_efs=true, enable_dynamodb_uid=true, and use_cognito=true."
     }
   }
+
+  # The bootstrap scripts must exist in S3 before any instance boots and runs the
+  # user_data stub that fetches them (#16).
+  depends_on = [aws_s3_object.userdata, aws_s3_object.bake]
 }
 
 resource "aws_autoscaling_group" "ood" {
