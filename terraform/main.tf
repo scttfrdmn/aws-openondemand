@@ -63,9 +63,14 @@ locals {
   alb_subnets = length(var.alb_subnet_ids) > 0 ? var.alb_subnet_ids : [var.subnet_id]
 
   # Adapter flags
-  enable_batch       = contains(var.adapters_enabled, "batch")
-  enable_sagemaker   = contains(var.adapters_enabled, "sagemaker")
-  enable_ec2_adapter = contains(var.adapters_enabled, "ec2")
+  enable_batch              = contains(var.adapters_enabled, "batch")
+  enable_sagemaker          = contains(var.adapters_enabled, "sagemaker")
+  enable_ec2_adapter        = contains(var.adapters_enabled, "ec2")
+  enable_omics              = contains(var.adapters_enabled, "omics")
+  enable_emr                = contains(var.adapters_enabled, "emr")
+  enable_sagemaker_training = contains(var.adapters_enabled, "sagemaker-training")
+  enable_fargate            = contains(var.adapters_enabled, "fargate")
+  enable_stepfunctions      = contains(var.adapters_enabled, "stepfunctions")
 
   # Precondition: spot profile requires cloud-native stack
   # (enforced below via lifecycle precondition on the ASG)
@@ -399,6 +404,26 @@ resource "aws_iam_role_policy" "ssm_session_s3" {
       Resource = [
         aws_s3_bucket.ssm_sessions[0].arn,
         "${aws_s3_bucket.ssm_sessions[0].arn}/sessions/*",
+      ]
+    }]
+  })
+}
+
+# Read access to the bootstrap artifact bucket so the launch-template stub can
+# fetch userdata.sh / bake.sh at boot (#16). Scoped to this bucket only. The CMK
+# decrypt grant (when enable_kms_cmk) is already covered by the EC2Access
+# statement on aws_kms_key.ood, so no extra KMS policy is needed here.
+resource "aws_iam_role_policy" "artifacts_read" {
+  name_prefix = "ood-artifacts-read-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = ["s3:GetObject", "s3:ListBucket"]
+      Resource = [
+        aws_s3_bucket.artifacts.arn,
+        "${aws_s3_bucket.artifacts.arn}/*",
       ]
     }]
   })
@@ -1017,6 +1042,114 @@ resource "aws_s3_bucket_policy" "ood_files" {
 }
 
 # ---------------------------------------------------------------------------
+# Bootstrap artifact bucket — stages userdata.sh / bake.sh out of user_data
+# ---------------------------------------------------------------------------
+# EC2 user_data has a hard 16,384-byte limit (applied to the base64-encoded
+# value). scripts/userdata.sh alone is ~18 KB, so it cannot be inlined (#16).
+# Instead the launch template carries a tiny stub that fetches the script from
+# this bucket, verifies its SHA256, and execs it. The "ood-" name prefix is
+# REQUIRED: the S3 gateway endpoint policy (aws_vpc_endpoint_policy.s3) scopes
+# reachable buckets to arn:aws:s3:::ood-*, so this delivery path works even in
+# no-egress / VPC-endpoint-only deployments with no NAT or internet route.
+resource "aws_s3_bucket" "artifacts" {
+  bucket_prefix = "ood-artifacts-${var.environment}-"
+
+  tags = {
+    Name = "ood-artifacts-${var.environment}"
+  }
+
+  # Unlike ood_files (which holds user data), these are rebuildable artifacts
+  # re-uploaded from source on every apply — destroy must not be blocked.
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
+resource "aws_s3_bucket_versioning" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = var.enable_kms_cmk ? "aws:kms" : "AES256"
+      kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "artifacts" {
+  bucket                  = aws_s3_bucket.artifacts.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Deny non-TLS access and uploads that opt out of server-side encryption,
+# matching the hardening on the OOD files bucket (H1).
+resource "aws_s3_bucket_policy" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyHTTP"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.artifacts.arn,
+          "${aws_s3_bucket.artifacts.arn}/*",
+        ]
+        Condition = { Bool = { "aws:SecureTransport" = "false" } }
+      },
+      {
+        Sid       = "DenyUnencryptedUploads"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.artifacts.arn}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-server-side-encryption" = "false"
+          }
+        }
+      },
+    ]
+  })
+}
+
+# Stage the bootstrap scripts. source_hash forces a re-upload whenever the local
+# file changes, and filebase64sha256 (computed identically in the launch-template
+# stub) is what the instance verifies the download against at boot.
+resource "aws_s3_object" "userdata" {
+  bucket      = aws_s3_bucket.artifacts.id
+  key         = "userdata.sh"
+  source      = "${path.module}/../scripts/userdata.sh"
+  source_hash = filemd5("${path.module}/../scripts/userdata.sh")
+
+  # Inherit the bucket default encryption; set explicitly so DenyUnencryptedUploads
+  # never rejects the upload.
+  server_side_encryption = var.enable_kms_cmk ? "aws:kms" : "AES256"
+  kms_key_id             = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+}
+
+resource "aws_s3_object" "bake" {
+  bucket      = aws_s3_bucket.artifacts.id
+  key         = "bake.sh"
+  source      = "${path.module}/../scripts/bake.sh"
+  source_hash = filemd5("${path.module}/../scripts/bake.sh")
+
+  server_side_encryption = var.enable_kms_cmk ? "aws:kms" : "AES256"
+  kms_key_id             = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+}
+
+# ---------------------------------------------------------------------------
 # SSM Parameter Store — runtime config for userdata.sh
 # ---------------------------------------------------------------------------
 resource "aws_ssm_parameter" "ood_domain" {
@@ -1192,8 +1325,15 @@ resource "aws_launch_template" "ood" {
     }
   }
 
-  user_data = base64encode(join("\n", [
+  # #16: user_data is a tiny stub — it sets the OOD_* launch-time config, then
+  # fetches the real bootstrap script(s) from the artifact bucket, verifies their
+  # SHA256, and execs them. The 18 KB userdata.sh can no longer be inlined (the
+  # base64-encoded value would exceed EC2's 16,384-byte hard limit). The hashes
+  # below are computed by Terraform from the exact files uploaded to S3, so
+  # verification is intrinsic — there is no separate checksum file to drift.
+  user_data = base64encode(join("\n", concat([
     "#!/usr/bin/env bash",
+    "set -euo pipefail",
     "export OOD_ENVIRONMENT='${var.environment}'",
     "export OOD_ENABLE_PARAMETER_STORE='${tostring(var.enable_parameter_store)}'",
     "export OOD_ENABLE_MONITORING='${tostring(var.enable_monitoring)}'",
@@ -1210,8 +1350,23 @@ resource "aws_launch_template" "ood" {
     "export OOD_ADAPTERS_ENABLED='${jsonencode(var.adapters_enabled)}'",
     "export OOD_LOG_GROUP_PREFIX='/aws/ec2/ood-${var.environment}'",
     "export OOD_DOMAIN='${var.domain_name}'",
-    file("${path.module}/../scripts/userdata.sh")
-  ]))
+    "ARTIFACT_BUCKET='${aws_s3_bucket.artifacts.id}'",
+    ],
+    # bake.sh runs at boot only on the base AL2023 AMI; with a pre-baked AMI it was
+    # already applied at image build time (matches the CDK base-AMI branch).
+    var.enable_packer_ami ? ["# Baked AMI — bake.sh already applied at image build time"] : [
+      "aws s3 cp \"s3://$ARTIFACT_BUCKET/bake.sh\" /tmp/bake.sh --region ${var.aws_region}",
+      "echo '${filesha256("${path.module}/../scripts/bake.sh")}  /tmp/bake.sh' | sha256sum -c -",
+      "bash /tmp/bake.sh",
+      "rm -f /tmp/bake.sh",
+    ],
+    [
+      "aws s3 cp \"s3://$ARTIFACT_BUCKET/userdata.sh\" /tmp/userdata.sh --region ${var.aws_region}",
+      "echo '${filesha256("${path.module}/../scripts/userdata.sh")}  /tmp/userdata.sh' | sha256sum -c -",
+      "bash /tmp/userdata.sh",
+      "rm -f /tmp/userdata.sh",
+    ]
+  )))
 
   tag_specifications {
     resource_type = "instance"
@@ -1233,6 +1388,10 @@ resource "aws_launch_template" "ood" {
       error_message = "spot profile requires enable_efs=true, enable_dynamodb_uid=true, and use_cognito=true."
     }
   }
+
+  # The bootstrap scripts must exist in S3 before any instance boots and runs the
+  # user_data stub that fetches them (#16).
+  depends_on = [aws_s3_object.userdata, aws_s3_object.bake]
 }
 
 resource "aws_autoscaling_group" "ood" {
@@ -2551,6 +2710,197 @@ resource "aws_sagemaker_user_profile" "ood_default" {
   user_settings {
     execution_role = aws_iam_role.sagemaker_execution[0].arn
   }
+}
+
+# ---------------------------------------------------------------------------
+# HealthOmics adapter (conditional on adapters_enabled containing "omics")
+# ---------------------------------------------------------------------------
+resource "aws_iam_role_policy" "omics_adapter" {
+  count       = local.enable_omics ? 1 : 0
+  name_prefix = "ood-omics-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["omics:StartRun", "omics:GetRun", "omics:CancelRun", "omics:ListRuns"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "omics.amazonaws.com" }
+        }
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# EMR Serverless adapter (conditional on adapters_enabled containing "emr")
+# ---------------------------------------------------------------------------
+resource "aws_emrserverless_application" "ood" {
+  count         = local.enable_emr ? 1 : 0
+  name          = "ood-${var.environment}"
+  release_label = "emr-7.0.0"
+  type          = "spark"
+
+  tags = {
+    Name = "ood-emr-${var.environment}"
+  }
+}
+
+resource "aws_ssm_parameter" "emr_application_id" {
+  count = local.enable_emr ? 1 : 0
+  name  = "/ood/${var.environment}/emr_application_id"
+  type  = "String"
+  value = aws_emrserverless_application.ood[0].id
+}
+
+resource "aws_iam_role_policy" "emr_adapter" {
+  count       = local.enable_emr ? 1 : 0
+  name_prefix = "ood-emr-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "emr-serverless:StartJobRun",
+          "emr-serverless:GetJobRun",
+          "emr-serverless:CancelJobRun",
+          "emr-serverless:ListJobRuns",
+        ]
+        Resource = [
+          aws_emrserverless_application.ood[0].arn,
+          "${aws_emrserverless_application.ood[0].arn}/jobruns/*",
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "emr-serverless.amazonaws.com" }
+        }
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# SageMaker Training adapter (conditional on adapters_enabled containing "sagemaker-training")
+# ---------------------------------------------------------------------------
+resource "aws_iam_role_policy" "sagemaker_training_adapter" {
+  count       = local.enable_sagemaker_training ? 1 : 0
+  name_prefix = "ood-sagemaker-training-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sagemaker:CreateTrainingJob",
+          "sagemaker:DescribeTrainingJob",
+          "sagemaker:StopTrainingJob",
+          "sagemaker:ListTrainingJobs",
+        ]
+        Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:training-job/ood-*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "sagemaker.amazonaws.com" }
+        }
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Fargate adapter (conditional on adapters_enabled containing "fargate")
+# ---------------------------------------------------------------------------
+resource "aws_ecs_cluster" "ood" {
+  count = local.enable_fargate ? 1 : 0
+  name  = "ood-${var.environment}"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
+  tags = {
+    Name = "ood-fargate-${var.environment}"
+  }
+}
+
+resource "aws_iam_role_policy" "fargate_adapter" {
+  count       = local.enable_fargate ? 1 : 0
+  name_prefix = "ood-fargate-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["ecs:RunTask", "ecs:StopTask", "ecs:ListTasks"]
+        Resource = [
+          aws_ecs_cluster.ood[0].arn,
+          "${aws_ecs_cluster.ood[0].arn}/task/*",
+          "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/*",
+        ]
+      },
+      {
+        # DescribeTasks requires Resource="*"
+        Effect   = "Allow"
+        Action   = ["ecs:DescribeTasks"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" }
+        }
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Step Functions adapter (conditional on adapters_enabled containing "stepfunctions")
+# ---------------------------------------------------------------------------
+resource "aws_iam_role_policy" "stepfunctions_adapter" {
+  count       = local.enable_stepfunctions ? 1 : 0
+  name_prefix = "ood-stepfunctions-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["states:StartExecution", "states:StopExecution", "states:ListExecutions"]
+        Resource = [
+          "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:stateMachine:ood-*",
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = ["states:DescribeExecution"]
+        Resource = [
+          "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:execution:ood-*:*",
+        ]
+      },
+    ]
+  })
 }
 
 # ---------------------------------------------------------------------------

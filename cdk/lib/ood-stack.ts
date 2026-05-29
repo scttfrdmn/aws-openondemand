@@ -21,7 +21,11 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import * as batch from "aws-cdk-lib/aws-batch";
 import * as sagemaker from "aws-cdk-lib/aws-sagemaker";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import { Construct } from "constructs";
+import * as crypto from "crypto";
+import * as fs from "fs";
+import * as path from "path";
 
 interface OodStackProps extends cdk.StackProps {
   environment: string;
@@ -647,22 +651,50 @@ export class OodStack extends cdk.Stack {
       cmk.grantEncryptDecrypt(instanceRole);
     }
 
+    // --- Bootstrap artifact bucket ---
+    // #16: EC2 user_data has a hard 16,384-byte limit; scripts/userdata.sh alone
+    // is ~18 KB, so it cannot be inlined. Stage the bootstrap scripts in S3 and
+    // carry only a tiny fetch-verify-exec stub in user_data. The "ood-" name
+    // prefix is REQUIRED so the deployment works in no-egress / VPC-endpoint-only
+    // setups (the S3 gateway endpoint policy scopes reachable buckets to ood-*).
+    const scriptsDir = path.join(__dirname, "..", "..", "scripts");
+    const sha256 = (file: string): string =>
+      crypto
+        .createHash("sha256")
+        .update(fs.readFileSync(path.join(scriptsDir, file)))
+        .digest("hex");
+    const userdataSha = sha256("userdata.sh");
+    const bakeSha = sha256("bake.sh");
+
+    const artifactBucket = new s3.Bucket(this, "ArtifactBucket", {
+      bucketName: `ood-artifacts-${props.environment}-${this.account}-${this.region}`,
+      versioned: true,
+      encryption: enableKmsCmk
+        ? s3.BucketEncryption.KMS
+        : s3.BucketEncryption.S3_MANAGED,
+      encryptionKey: cmk,
+      enforceSSL: true,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+    });
+
+    // Upload the bootstrap scripts (CDK-native equivalent of aws_s3_object).
+    new s3deploy.BucketDeployment(this, "ArtifactDeployment", {
+      destinationBucket: artifactBucket,
+      sources: [
+        s3deploy.Source.asset(scriptsDir, {
+          // Only ship the scripts the stub fetches — not the whole scripts dir.
+          exclude: ["**", "!userdata.sh", "!bake.sh"],
+        }),
+      ],
+      prune: false,
+    });
+
+    artifactBucket.grantRead(instanceRole);
+
     // --- User Data ---
     const userData = ec2.UserData.forLinux();
-    // C1: Pin to a commit SHA for production deployments to prevent supply chain attacks.
-    // Usage: cdk deploy -c scriptsBranch=<40-char-sha>
-    // Using "main" is acceptable for development but MUST NOT be used in prod.
-    const scriptsBranch =
-      this.node.tryGetContext("scriptsBranch") || "main";
-    const isSha = /^[a-f0-9]{40}$/.test(scriptsBranch);
-    if (!isSha && props.environment !== "test") {
-      throw new Error(
-        `scriptsBranch must be a full commit SHA (40 hex chars) for ${props.environment} deployments. ` +
-          `Got: "${scriptsBranch}". Using a mutable branch ref is a supply chain risk.`
-      );
-    }
-    const baseUrl = `https://raw.githubusercontent.com/scttfrdmn/aws-openondemand/${scriptsBranch}/scripts`;
-
     userData.addCommands(
       `export OOD_ENVIRONMENT="${props.environment}"`,
       `export OOD_DOMAIN="${domainName}"`,
@@ -681,24 +713,24 @@ export class OodStack extends cdk.Stack {
       `export OOD_S3_BROWSER_BUCKET="${s3BrowserBucket ? s3BrowserBucket.bucketName : ""}"`,
       `export OOD_ADAPTERS_ENABLED='${JSON.stringify(adaptersEnabled)}'`,
       `export OOD_LOG_GROUP_PREFIX="${logGroupPrefix}"`,
-      // H3: download-then-verify-then-run instead of curl|bash to prevent
-      // truncated-download execution and enable SHA verification.
-      // L1: when enablePackerAmi=true, scriptsBranch is only used for userdata.sh (not bake.sh).
-      // The bake.sh was already applied at AMI build time from the commit SHA recorded in the AMI tags.
+      `ARTIFACT_BUCKET="${artifactBucket.bucketName}"`,
+      // Fetch-verify-exec from S3. The SHA256 is computed at synth time from the
+      // exact file uploaded to the bucket, so verification is intrinsic — there
+      // is no separate checksum file to drift, and a mismatch hard-fails the boot.
+      // L1: with a pre-baked AMI, bake.sh was already applied at image build time.
+      // UserData.forLinux() does not enable `set -e`, so each step fails explicitly.
       ...(enablePackerAmi
         ? ["# Baked AMI — bake.sh already applied at image build time"]
         : [
-            `curl -fsSL "${baseUrl}/bake.sh" -o /tmp/bake.sh`,
-            `curl -fsSL "${baseUrl}/bake.sh.sha256" -o /tmp/bake.sh.sha256 || true`,
-            `if [ -s /tmp/bake.sh.sha256 ]; then sha256sum -c /tmp/bake.sh.sha256 || { echo "bake.sh checksum mismatch" >&2; exit 1; }; fi`,
+            `aws s3 cp "s3://$ARTIFACT_BUCKET/bake.sh" /tmp/bake.sh --region ${this.region} || { echo "bake.sh download failed" >&2; exit 1; }`,
+            `echo "${bakeSha}  /tmp/bake.sh" | sha256sum -c - || { echo "bake.sh checksum mismatch" >&2; exit 1; }`,
             `bash /tmp/bake.sh`,
-            `rm -f /tmp/bake.sh /tmp/bake.sh.sha256`,
+            `rm -f /tmp/bake.sh`,
           ]),
-      `curl -fsSL "${baseUrl}/userdata.sh" -o /tmp/userdata.sh`,
-      `curl -fsSL "${baseUrl}/userdata.sh.sha256" -o /tmp/userdata.sh.sha256 || true`,
-      `if [ -s /tmp/userdata.sh.sha256 ]; then sha256sum -c /tmp/userdata.sh.sha256 || { echo "userdata.sh checksum mismatch" >&2; exit 1; }; fi`,
+      `aws s3 cp "s3://$ARTIFACT_BUCKET/userdata.sh" /tmp/userdata.sh --region ${this.region} || { echo "userdata.sh download failed" >&2; exit 1; }`,
+      `echo "${userdataSha}  /tmp/userdata.sh" | sha256sum -c - || { echo "userdata.sh checksum mismatch" >&2; exit 1; }`,
       `bash /tmp/userdata.sh`,
-      `rm -f /tmp/userdata.sh /tmp/userdata.sh.sha256`
+      `rm -f /tmp/userdata.sh`
     );
 
     // --- Launch Template ---
