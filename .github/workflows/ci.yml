@@ -92,7 +92,7 @@ jobs:
           soft_fail: false
 
       - name: checkov (IaC policy scan)
-        uses: bridgecrewio/checkov-action@3b5b35d8b7e52f27bc58d05e3b56e55a9e5e3ec7 # M1: pinned v3.2.2 — @master is mutable
+        uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0 (the old v3.2.2 pin no longer resolves — action retagged to CalVer)
         with:
           directory: terraform
           framework: terraform
