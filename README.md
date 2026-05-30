@@ -408,6 +408,16 @@ packer init .
 GIT_SHA=$(git rev-parse --short HEAD) packer build ood.pkr.hcl
 ```
 
+**Build network.** By default the build instance gets **no public IP**
+(`build_public_ip=false`), assuming a private subnet with a NAT gateway and a
+Packer host with a route into the VPC. To build in an **IGW-only / default VPC**
+(single public subnet, no NAT) — e.g. from a workstation outside the VPC — pass
+`-var build_public_ip=true` so Packer can reach the instance over its public IP:
+
+```bash
+packer build -var build_public_ip=true -var subnet_id=subnet-xxx ood.pkr.hcl
+```
+
 The AMI includes OOD, oidc-pam, all adapter binaries, Nginx, Passenger,
 and the CloudWatch agent. Configuration is pulled from SSM Parameter Store
 at boot — the AMI is the software, Parameter Store is the config.

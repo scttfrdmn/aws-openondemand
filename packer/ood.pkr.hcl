@@ -22,6 +22,15 @@ variable "subnet_id" {
   default = ""
 }
 
+variable "build_public_ip" {
+  type    = bool
+  default = false
+  # C3: default false — the secure topology is a private subnet with a NAT gateway, so the
+  # build instance has no public IP and Packer reaches it over a VPC route. Set
+  # -var build_public_ip=true to bake in an IGW-only/default VPC (single public subnet, no
+  # NAT), where the build host is outside the VPC and needs the instance's public IP for SSH (#45).
+}
+
 variable "ood_version" {
   type    = string
   default = ""
@@ -71,7 +80,10 @@ source "amazon-ebs" "ood" {
   ssh_username  = "ec2-user"
 
   subnet_id                   = var.subnet_id != "" ? var.subnet_id : null
-  associate_public_ip_address = false # C3: build in private subnet with NAT; no public IP needed
+  associate_public_ip_address = var.build_public_ip # #45: false by default (private+NAT); set build_public_ip=true for IGW-only/default VPCs
+  # Reach the build instance over its public IP only when one is assigned; otherwise use the
+  # private IP (the operator's host must have a route into the VPC, e.g. via NAT/VPN/peering).
+  ssh_interface = var.build_public_ip ? "public_ip" : "private_ip"
 
   # H3: enforce IMDSv2 on the build instance so the baked AMI inherits the
   # metadata options and cannot fall back to IMDSv1 even before the launch
