@@ -1404,6 +1404,7 @@ resource "aws_launch_template" "ood" {
     "export OOD_ADAPTERS_ENABLED='${jsonencode(var.adapters_enabled)}'",
     "export OOD_LOG_GROUP_PREFIX='/aws/ec2/ood-${var.environment}'",
     "export OOD_DOMAIN='${var.domain_name}'",
+    "export OOD_ALB_DNS='${var.enable_alb ? aws_lb.ood[0].dns_name : ""}'",
     "export OOD_OIDC_PAM_VERSION='${var.oidc_pam_version}'",
     "ARTIFACT_BUCKET='${aws_s3_bucket.artifacts.id}'",
     ],
