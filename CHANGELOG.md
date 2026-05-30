@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `terraform/main.tf`: ALB-logs bucket policy no longer rejected as malformed (#31).
+  Removed the `DenyVersioningDisable` statement — it used a non-existent S3 condition
+  key (`s3:VersionStatus`), so S3 rejected the entire policy on PutBucketPolicy and
+  blocked every `enable_alb=true` apply. Versioning stays enforced by the
+  `aws_s3_bucket_versioning` resource; keeping it on belongs to an SCP/permissions
+  boundary or S3 Object Lock, not a bucket-policy condition.
 - `scripts/userdata.sh`: SSM Parameter Store values are no longer lost to a pipe
   subshell — the `OOD_*` assignments now persist, so the oidc-auth-broker is actually
   configured and started (#24).
