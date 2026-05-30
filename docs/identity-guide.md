@@ -52,6 +52,11 @@ gets the same UID on every instance. Requires `enable_dynamodb_uid = true` (the 
 with it off, the hook no-ops and accounts must be provisioned by other means
 (SSSD/directory sync). See `scripts/ood-provision-user.sh`.
 
+To give a *job* (rather than the login session) narrower, expiring AWS credentials under a
+per-PI or per-job IAM role instead of the instance role, see
+[Scoping job credentials with aws-role-exec](adapter-guide.md#scoping-job-credentials-with-aws-role-exec)
+in the adapter guide.
+
 ## InCommon / Shibboleth Federation
 
 Set `cognito_saml_metadata_url` to your institution's InCommon metadata URL:
