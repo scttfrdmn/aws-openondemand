@@ -58,8 +58,9 @@ locals {
   # Effective private subnets for EFS/ElastiCache/etc.
   private_subnets = length(var.private_subnet_ids) > 0 ? var.private_subnet_ids : [var.subnet_id]
 
-  # C1: ALB subnets — operator should provide at least 2 subnets in different AZs for prod/staging.
-  # If alb_subnet_ids is empty, fall back to a single subnet (acceptable only for test).
+  # ALB subnets — an ALB always requires >=2 subnets in different AZs (#33), so operators
+  # must set alb_subnet_ids when enable_alb=true. The fallback to the single subnet_id only
+  # exists so non-ALB deploys evaluate cleanly; the aws_lb precondition rejects a <2-AZ ALB.
   alb_subnets = length(var.alb_subnet_ids) > 0 ? var.alb_subnet_ids : [var.subnet_id]
 
   # Adapter flags
@@ -1711,11 +1712,13 @@ resource "aws_lb" "ood" {
   depends_on = [aws_s3_bucket_policy.alb_logs]
 
   lifecycle {
-    # C1: staging and prod require multi-AZ ALB subnets to survive an AZ outage.
-    # Set alb_subnet_ids to subnets in at least 2 different AZs in staging/prod.tfvars.
+    # #33: an Application Load Balancer ALWAYS requires subnets in >=2 AZs — AWS rejects a
+    # single-subnet ALB at creation regardless of environment. (This previously exempted
+    # test, which always failed at aws_lb creation with the default single subnet_id.)
+    # distinct() guards against the same subnet listed twice (still one AZ).
     precondition {
-      condition     = var.environment == "test" || length(local.alb_subnets) >= 2
-      error_message = "ALB requires at least 2 subnets in different AZs for staging and prod deployments. Set alb_subnet_ids in your tfvars."
+      condition     = length(distinct(local.alb_subnets)) >= 2
+      error_message = "enable_alb=true requires at least 2 subnets in different AZs. Set alb_subnet_ids to two subnets in distinct AZs (an ALB cannot be created in a single AZ)."
     }
   }
 }

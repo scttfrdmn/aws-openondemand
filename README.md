@@ -246,11 +246,15 @@ terraform apply -var-file=environments/test.tfvars \
   -var='allowed_cidr=1.2.3.4/32'
 
 # Staging (ALB + WAF, 2 subnets in different AZs)
+# NOTE: enable_alb=true ALWAYS needs alb_subnet_ids set to >=2 subnets in
+# different AZs (an ALB cannot be created in a single AZ) — this applies to every
+# environment, including test. terraform plan fails fast if it's unset.
 terraform apply -var-file=environments/staging.tfvars \
   -var='vpc_id=vpc-xxx' \
   -var='subnet_id=subnet-xxx' \
   -var='allowed_cidr=0.0.0.0/0' \
-  -var='domain_name=ood-staging.university.edu'
+  -var='domain_name=ood-staging.university.edu' \
+  -var='alb_subnet_ids=["subnet-aaa","subnet-bbb"]'
 
 # Production (all features, compliance logging)
 terraform apply -var-file=environments/prod.tfvars \
