@@ -79,6 +79,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (rather than emitted with an empty `metrics` array) when `enable_efs = false`.
 
 ### Added
+- CDK parity (`cdk/lib/ood-stack.ts`): brought the CDK stack back in line with the
+  Terraform source of truth (#51). Added the EMR Serverless application and ECS/Fargate
+  cluster, the six previously-missing adapter IAM blocks (omics, emr, sagemaker-training,
+  fargate, stepfunctions, braket), the `#37` `broker_token_key` SSM **SecureString** (via a
+  custom resource — CloudFormation cannot create a SecureString natively), the `#22`
+  CloudWatch dashboard (CPU + conditional EFS widgets), `#31` ALB access logging, and the
+  adapter/infra `CfnOutput`s (`BatchJobQueueArn`, `SageMakerDomainId`, `EmrApplicationId`,
+  `EcsClusterArn`, `ArtifactsBucket`). Also ported `#39` (uid map re-keyed on `username` +
+  provision-user staging), `#49` (`ARTIFACT_BUCKET` exported into user_data), `#25` (the
+  ALB is created before the Cognito client so its DNS is the OIDC callback host, with a
+  fail-fast guard for the no-ALB/no-domain Cognito case), and `#33` (the >=2-AZ-subnet ALB
+  guard). The single intentional divergence: the CDK `broker_token_key` re-generates on each
+  synth (CDK has no equivalent of Terraform's stateful `random_password`); benign for a
+  token-encryption key — it only forces re-authentication, documented inline.
 - `docs/adapter-guide.md` + `README.md`: documented how to scope adapter/job credentials
   with [`aws-role-exec`](https://github.com/scttfrdmn/aws-role-exec) — wrap an adapter's
   cluster-YAML submit (or a Slurm/PBS prolog) so AWS calls run under a narrower, expiring
