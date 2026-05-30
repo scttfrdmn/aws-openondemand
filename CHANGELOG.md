@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `packer/ood.pkr.hcl`: `associate_public_ip_address` is now a `build_public_ip` variable
+  (default false) instead of a hardcoded false (#45). IGW-only/default VPCs (single public
+  subnet, no NAT) can pass `-var build_public_ip=true` to bake the AMI from a host outside
+  the VPC; `ssh_interface` follows the same flag. The secure private-subnet+NAT default is
+  unchanged.
 - `terraform/main.tf`: `enable_alb=true` now fails fast at plan unless `alb_subnet_ids`
   has >=2 subnets in different AZs — an ALB cannot be created in a single AZ, so the prior
   test-environment single-subnet fallback always failed at `aws_lb` creation with an AWS
