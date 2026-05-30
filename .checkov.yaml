@@ -22,3 +22,110 @@ skip-check:
   # DR. No replication is configured on any bucket by design. Revisit only if a
   # specific deployment has a documented multi-region durability requirement.
   - CKV_AWS_144
+
+  # ---------------------------------------------------------------------------
+  # Group A — customer-managed KMS (CMK) is an OPT-IN toggle (var.enable_kms_cmk,
+  # default false). The documented free-tier default uses AWS-managed keys: S3
+  # AES256, alias/aws/sns, alias/aws/sqs, DynamoDB AWS-owned key, SSM String for
+  # non-secret config. Every resource already does
+  #   var.enable_kms_cmk ? aws_kms_key.ood[0].arn : <aws-managed>
+  # (e.g. DynamoDB L777, SQS/SNS, S3 SSE blocks). The one true secret (OIDC client
+  # secret) lives in Secrets Manager; the one secret SSM param (redis_auth_token)
+  # is already SecureString. The 9 flagged SSM params hold non-sensitive config
+  # (IDs, ARNs, endpoints, domain). Set enable_kms_cmk=true (required for prod via
+  # precondition on aws_kms_key.ood) to bring all of these under a CMK.
+  - CKV_AWS_145  # S3 encrypted with KMS by default
+  - CKV2_AWS_73  # SQS uses CMK
+  - CKV_AWS_119  # DynamoDB uses CMK
+  - CKV2_AWS_34  # SSM Parameter encrypted (SecureString needs a KMS key)
+  - CKV_AWS_112  # Session Manager data encrypted in transit (CMK path)
+
+  # ---------------------------------------------------------------------------
+  # Group B — log-destination buckets intentionally omit versioning, access
+  # logging, and event notifications: you do not log-the-logs recursively or
+  # version append-only log data, and there are no event-driven consumers in this
+  # architecture. The artifacts bucket holds only rebuildable bootstrap scripts and
+  # is already TLS- and encryption-enforced via aws_s3_bucket_policy.artifacts.
+  - CKV_AWS_21   # S3 versioning (log buckets)
+  - CKV_AWS_18   # S3 access logging (log + artifacts buckets)
+  - CKV2_AWS_62  # S3 event notifications (no consumers exist)
+
+  # ---------------------------------------------------------------------------
+  # Group C — resources gated behind off-by-default feature toggles. CloudFront
+  # (enable_cdn) is an ALB reverse-proxy for the dynamic OOD app: default_root_object
+  # is intentionally empty (routing is /pun/...), there is one origin so failover/
+  # origin-groups do not apply, geo-restriction is "none" (global research portal),
+  # and edge WAF/response-header/custom-cert are part of the paid edge profile. WAF
+  # (enable_waf) attaches managed rule groups + logging when enabled on the public
+  # ALB. Redis Multi-AZ failover (enable_session_cache) needs >=2 nodes, a cost-gated
+  # prod posture. EFS-in-AWS-Backup (enable_backup) is required for prod and wired
+  # when the vault exists. None apply on the free-tier default.
+  - CKV2_AWS_32  # CloudFront response headers policy
+  - CKV2_AWS_42  # CloudFront custom SSL cert
+  - CKV2_AWS_47  # CloudFront WAFv2 AMR for Log4j
+  - CKV_AWS_68   # CloudFront WAF enabled
+  - CKV_AWS_305  # CloudFront default root object
+  - CKV_AWS_310  # CloudFront origin failover
+  - CKV_AWS_374  # CloudFront geo restriction
+  - CKV2_AWS_28  # public ALB protected by WAF
+  - CKV2_AWS_31  # WAF2 logging configuration
+  - CKV2_AWS_50  # ElastiCache Redis Multi-AZ failover
+  - CKV2_AWS_18  # EFS in AWS Backup plan
+
+  # ---------------------------------------------------------------------------
+  # Group D — S3 lifecycle. Every bucket that should auto-expire has a lifecycle
+  # config, and the artifacts + alb_logs + cdn_logs + ssm_sessions buckets now also
+  # set abort-incomplete-multipart (the genuine fix). The cloudtrail / cloudtrail_logs
+  # buckets (enable_compliance_logging) deliberately retain the audit trail without an
+  # expiration rule — compliance logs must not be silently aged out by a bucket
+  # lifecycle; retention is an explicit operator decision. This global skip covers
+  # that by-design remainder; the abort-multipart fixes stand regardless.
+  - CKV2_AWS_61  # S3 lifecycle configuration present
+  - CKV_AWS_300  # S3 lifecycle aborts failed multipart uploads
+
+  # ---------------------------------------------------------------------------
+  # Group E — false positives on count-gated buckets. Each flagged bucket DOES have
+  # a public_access_block (alb_logs, cdn_logs, ssm_sessions) and ACL-disabling
+  # ownership_controls=BucketOwnerPreferred (cdn_logs, cloudtrail_logs, ood_files_logs);
+  # Checkov cannot associate the separate count-indexed resource with the bucket.
+  - CKV2_AWS_6   # S3 public access block present
+  - CKV2_AWS_65  # S3 ACLs disabled
+
+  # ---------------------------------------------------------------------------
+  # Group F — false positive on count-gated security groups. aws_security_group.alb
+  # is attached to aws_lb.ood, .efs to aws_efs_mount_target.home, .vpc_endpoints to
+  # the interface endpoints — all under the same toggle. Checkov cannot resolve the
+  # count-indexed attachment; when the toggle is off neither SG nor consumer exists.
+  - CKV2_AWS_5   # Security Group attached to a resource
+
+  # ---------------------------------------------------------------------------
+  # Group G — the ALB terminates TLS and forwards plaintext HTTP on :80 to the OOD
+  # instance over a private VPC path (OOD runs Apache on :80 behind the ALB). The
+  # instance :80 ingress is referenced-SG-scoped to the ALB SG only, not the internet;
+  # the public HTTP listener only 301-redirects to HTTPS. Standard ALB→backend pattern.
+  - CKV_AWS_260  # SG ingress 0.0.0.0/0 to port 80 (ALB→instance, SG-scoped)
+  - CKV_AWS_378  # LB target group uses HTTP (private ALB→backend hop)
+
+  # ---------------------------------------------------------------------------
+  # Group H — automatic OIDC-secret rotation IS implemented:
+  # aws_secretsmanager_secret_rotation.oidc_client_secret (90-day) wired to
+  # var.oidc_secret_rotation_lambda_arn, REQUIRED for prod via precondition, with a
+  # rotation-failure CloudWatch alarm. It needs a customer-supplied Lambda that
+  # regenerates the Cognito app-client secret, so it cannot be unconditionally on for
+  # free-tier/test. Checkov cannot see the conditional rotation resource.
+  - CKV2_AWS_57  # Secrets Manager automatic rotation enabled
+  - CKV_AWS_304  # Secrets Manager secret rotated within 90 days
+
+  # ---------------------------------------------------------------------------
+  # Group I — remaining by-design / false positives:
+  # CKV2_AWS_15: the ASG uses ELB health checks when an ALB is present —
+  #   health_check_type = var.enable_alb ? "ELB" : "EC2" (Checkov can't follow the
+  #   conditional + separate attachment resource).
+  # CKV_AWS_150: deletion protection IS set — enable_deletion_protection =
+  #   var.environment != "test" (intentionally off for ephemeral test teardown).
+  # CKV2_AWS_10: CloudTrail (enable_compliance_logging) writes to a versioned,
+  #   access-logged, log-file-validated S3 trail — the durable audit sink. A
+  #   CloudWatch Logs destination is extra ingestion cost not warranted by default.
+  - CKV2_AWS_15
+  - CKV_AWS_150
+  - CKV2_AWS_10

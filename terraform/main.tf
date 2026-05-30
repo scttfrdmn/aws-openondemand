@@ -148,33 +148,37 @@ resource "aws_security_group" "ood" {
     }
   }
 
+  # Outbound HTTPS/HTTP/DNS to the internet is required: OS package repos, AWS
+  # service APIs (when not using VPC endpoints), OOD/oidc-pam release downloads,
+  # and OIDC/Cognito. Inbound is the controlled surface (allowed_cidr); egress to
+  # 0.0.0.0/0 on these ports is normal.
   egress {
     description = "HTTPS outbound"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"] #tfsec:ignore:aws-ec2-no-public-egress-sgr
   }
   egress {
     description = "HTTP outbound (package repos)"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"] #tfsec:ignore:aws-ec2-no-public-egress-sgr
   }
   egress {
     description = "DNS UDP"
     from_port   = 53
     to_port     = 53
     protocol    = "udp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"] #tfsec:ignore:aws-ec2-no-public-egress-sgr
   }
   egress {
     description = "DNS TCP"
     from_port   = 53
     to_port     = 53
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"] #tfsec:ignore:aws-ec2-no-public-egress-sgr
   }
 
   # EFS NFS egress — scoped to VPC CIDR to avoid SG cycle
@@ -392,6 +396,9 @@ resource "aws_iam_role_policy" "ssm_params" {
 }
 
 # M6: allow instance to write SSM session transcripts to S3
+# False positive for aws-iam-no-policy-wildcards: the wildcard is on the OBJECT KEY
+# (sessions/*) within a single named bucket ARN, not the resource. No broad s3:* on *.
+#tfsec:ignore:aws-iam-no-policy-wildcards
 resource "aws_iam_role_policy" "ssm_session_s3" {
   count       = var.enable_monitoring ? 1 : 0
   name_prefix = "ood-ssm-session-s3-"
@@ -766,8 +773,10 @@ resource "aws_dynamodb_table" "uid_map" {
     enabled = true
   }
 
+  # DynamoDB always encrypts at rest; this block only selects the KEY (CMK when
+  # enable_kms_cmk=true, else the AWS-owned key — the free-tier default).
   server_side_encryption {
-    enabled     = var.enable_kms_cmk
+    enabled     = var.enable_kms_cmk #tfsec:ignore:aws-dynamodb-enable-at-rest-encryption
     kms_key_arn = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
   }
 
@@ -1051,6 +1060,10 @@ resource "aws_s3_bucket_policy" "ood_files" {
 # REQUIRED: the S3 gateway endpoint policy (aws_vpc_endpoint_policy.s3) scopes
 # reachable buckets to arn:aws:s3:::ood-*, so this delivery path works even in
 # no-egress / VPC-endpoint-only deployments with no NAT or internet route.
+# The artifacts bucket holds only rebuildable bootstrap scripts (userdata.sh/
+# bake.sh), already TLS- and encryption-enforced via aws_s3_bucket_policy.artifacts.
+# Access logging would require a second always-on bucket for no audit value.
+#tfsec:ignore:aws-s3-enable-bucket-logging
 resource "aws_s3_bucket" "artifacts" {
   bucket_prefix = "ood-artifacts-${var.environment}-"
 
@@ -1122,6 +1135,31 @@ resource "aws_s3_bucket_policy" "artifacts" {
       },
     ]
   })
+}
+
+# CKV2_AWS_61 / CKV_AWS_300: the artifacts bucket is versioned and re-uploaded on
+# every apply, so noncurrent versions and aborted multipart uploads would
+# accumulate indefinitely. Expire old script versions and clean up failed uploads.
+resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+
+  rule {
+    id     = "abort-incomplete-multipart"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
+  rule {
+    id     = "expire-noncurrent-versions"
+    status = "Enabled"
+    filter {}
+    noncurrent_version_expiration {
+      noncurrent_days = 30
+    }
+  }
 }
 
 # Stage the bootstrap scripts. source_hash forces a re-upload whenever the local
@@ -1484,6 +1522,9 @@ resource "aws_dlm_lifecycle_policy" "ood" {
 # ---------------------------------------------------------------------------
 data "aws_elb_service_account" "main" {}
 
+# This IS a log-destination bucket (ALB access logs); enabling access logging on
+# it would recursively log-the-logs.
+#tfsec:ignore:aws-s3-enable-bucket-logging
 resource "aws_s3_bucket" "alb_logs" {
   count         = var.enable_alb ? 1 : 0
   bucket_prefix = "ood-alb-logs-${var.environment}-"
@@ -1503,6 +1544,9 @@ resource "aws_s3_bucket_public_access_block" "alb_logs" {
   restrict_public_buckets = true
 }
 
+# ALB access-log delivery requires SSE-S3 (AES256); the ELB service account cannot
+# write with SSE-KMS. CMK is not an option for this bucket regardless of enable_kms_cmk.
+#tfsec:ignore:aws-s3-encryption-customer-key
 resource "aws_s3_bucket_server_side_encryption_configuration" "alb_logs" {
   count  = var.enable_alb ? 1 : 0
   bucket = aws_s3_bucket.alb_logs[0].id
@@ -1531,6 +1575,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "alb_logs" {
     filter {}
     expiration {
       days = var.environment == "prod" ? 365 : 90 # L4: prevent unbounded growth
+    }
+  }
+  rule {
+    id     = "abort-incomplete-multipart" # CKV_AWS_300
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
     }
   }
 }
@@ -1579,14 +1631,20 @@ resource "aws_s3_bucket_policy" "alb_logs" {
 # ALB + ACM (optional)
 # ---------------------------------------------------------------------------
 resource "aws_lb" "ood" {
-  count              = var.enable_alb ? 1 : 0
-  name_prefix        = "ood-"
-  internal           = false
+  count       = var.enable_alb ? 1 : 0
+  name_prefix = "ood-"
+  # Public research portal — an internet-facing ALB is the product. Access is
+  # fronted by allowed_cidr SG rules and (optionally) WAF when enable_waf=true.
+  internal           = false #tfsec:ignore:aws-elb-alb-not-public
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb[0].id]
   subnets            = local.alb_subnets
 
   enable_deletion_protection = var.environment != "test"
+
+  # CKV_AWS_131 / tfsec aws-elb-drop-invalid-headers: drop malformed headers
+  # before they reach the OOD backend.
+  drop_invalid_header_fields = true
 
   access_logs {
     bucket  = aws_s3_bucket.alb_logs[0].bucket
@@ -2076,6 +2134,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "cdn_logs" {
     filter {}
     expiration { days = var.environment == "prod" ? 365 : 90 }
   }
+  rule {
+    id     = "abort-incomplete-multipart" # CKV_AWS_300
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
 }
 
 resource "aws_cloudfront_distribution" "ood" {
@@ -2197,7 +2263,8 @@ resource "aws_sns_topic" "ood" {
   count = var.enable_monitoring ? 1 : 0
   name  = "ood-alarms-${var.environment}"
   # C1: Always encrypt SNS — use CMK when available, fall back to AWS-managed SNS key (never unencrypted)
-  kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : "alias/aws/sns"
+  # CMK is opt-in (enable_kms_cmk); AWS-managed alias/aws/sns is the free-tier default.
+  kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : "alias/aws/sns" #tfsec:ignore:aws-sns-topic-encryption-use-cmk
 }
 
 resource "aws_sns_topic_subscription" "email" {
@@ -2214,7 +2281,8 @@ resource "aws_sqs_queue" "alarm_dlq" {
   name                       = "ood-alarm-dlq-${var.environment}"
   message_retention_seconds  = 1209600 # 14 days — long enough for on-call rotation to review
   visibility_timeout_seconds = 30      # standard for consumer-less audit queues
-  kms_master_key_id          = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : "alias/aws/sqs"
+  # CMK is opt-in (enable_kms_cmk); AWS-managed alias/aws/sqs is the free-tier default.
+  kms_master_key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : "alias/aws/sqs" #tfsec:ignore:aws-sqs-queue-encryption-use-cmk
 
   tags = { Name = "ood-alarm-dlq-${var.environment}" }
 }
@@ -2384,6 +2452,11 @@ resource "aws_cloudwatch_log_group" "ssm_sessions" {
 }
 
 # M6: S3 bucket for SSM session transcript dual-destination logging
+# SSM session transcripts are an append-only audit log. Logging-the-logs and
+# versioning add no value here; integrity is enforced by the bucket policy
+# (writes scoped to the OOD role) and lifecycle expiration.
+#tfsec:ignore:aws-s3-enable-bucket-logging
+#tfsec:ignore:aws-s3-enable-versioning
 resource "aws_s3_bucket" "ssm_sessions" {
   count         = var.enable_monitoring ? 1 : 0
   bucket_prefix = "ood-ssm-sessions-${var.environment}-"
@@ -2423,6 +2496,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "ssm_sessions" {
     filter {}
     expiration {
       days = var.environment == "prod" ? 365 : 90
+    }
+  }
+  rule {
+    id     = "abort-incomplete-multipart" # CKV_AWS_300
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
     }
   }
 }
