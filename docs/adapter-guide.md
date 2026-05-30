@@ -112,3 +112,64 @@ For traditional SLURM-based HPC clusters, see
 
 This is a reference configuration repo — not managed by this Terraform.
 ParallelCluster clusters appear as additional entries in `/etc/ood/config/clusters.d/`.
+
+## Scoping job credentials with aws-role-exec
+
+By default, adapters make AWS API calls under the **OOD instance role**. If you want a
+job (or a specific adapter) to run under a *narrower, per-PI or per-job* role instead —
+with credentials that expire at the end of the job — wrap the call with
+[`aws-role-exec`](https://github.com/scttfrdmn/aws-role-exec).
+
+`aws-role-exec` assumes an IAM role via `sts:AssumeRole` and execs a child process with
+the temporary credentials in its environment (`syscall.Exec` on Unix). No daemon, no
+config files, and nothing written to disk unless you ask for it; the credentials expire
+automatically at the end of the session. This is **optional and decoupled** — neither
+project depends on the other; it's a composition pattern.
+
+Why it fits OOD/HPC: credential lifetime can be tied to job walltime, scoping is
+per-identity rather than instance-wide (which an instance profile can't do), and it's a
+single static binary.
+
+**Wrap an adapter's submit (cluster YAML).** Point the cluster's `script:` at
+`aws-role-exec` and pass the real adapter as the child after `--`, so the adapter's AWS
+calls run under the assumed role:
+
+```yaml
+# /etc/ood/config/clusters.d/aws-batch.yml (excerpt)
+v2:
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/bin/aws-role-exec"
+      args:
+        - "--role-arn=arn:aws:iam::123456789012:role/ood-pi-smithlab"
+        - "--duration=8h"
+        - "--"
+        - "/usr/local/lib/ood-adapters/ood-aws-batch-adapter"
+        - submit
+        - "--region=us-west-2"
+```
+
+(The OOD instance role must be allowed to `sts:AssumeRole` the target role, and the
+target role's trust policy must permit it.)
+
+**Slurm / PBS prolog** (ParallelCluster jobs needing scoped AWS access):
+
+```bash
+aws-role-exec --role-arn arn:aws:iam::123456789012:role/researcher-s3-read -- srun "$@"
+```
+
+**Other patterns** (from the `aws-role-exec` README):
+
+```bash
+# Export into the current shell
+eval "$(aws-role-exec --role-arn arn:... --format env)"
+
+# Write a ~/.aws/credentials-style file for tools that read it
+aws-role-exec --role-arn arn:... --format credentials-file --output-file /tmp/job/.aws/credentials
+```
+
+Flags: `--role-arn` (required), `--duration` (default 1h, max 12h), `--session-name`,
+`--region`, `--format` (`env` | `json` | `credentials-file`), `--output-file`. See the
+[aws-role-exec README](https://github.com/scttfrdmn/aws-role-exec) for the full reference.

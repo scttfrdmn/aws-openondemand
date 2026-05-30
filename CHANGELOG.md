@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (rather than emitted with an empty `metrics` array) when `enable_efs = false`.
 
 ### Added
+- `docs/adapter-guide.md` + `README.md`: documented how to scope adapter/job credentials
+  with [`aws-role-exec`](https://github.com/scttfrdmn/aws-role-exec) — wrap an adapter's
+  cluster-YAML submit (or a Slurm/PBS prolog) so AWS calls run under a narrower, expiring
+  per-PI/per-job role instead of the instance role. Optional, decoupled composition pattern
+  (closes the documentation half of #10; the tool itself already exists and is published).
 - `docs/adapter-guide.md` + `terraform/outputs.tf`: documented how to deploy adapter
   binaries / app bundles — stage them into the existing `ood-artifacts-<env>-*` bucket
   (the instance role and S3 gateway endpoint only permit `ood-*`/the artifacts bucket, so a

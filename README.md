@@ -472,6 +472,7 @@ bash scripts/teardown-terraform-backend.sh
 | [ood-sagemaker-adapter](https://github.com/scttfrdmn/ood-sagemaker-adapter) | OOD interactive session launcher for SageMaker (standalone Go binary) |
 | [ood-ec2-adapter](https://github.com/scttfrdmn/ood-ec2-adapter) | OOD single-node compute via EC2 Launch Templates (standalone Go binary) |
 | [ood-pcluster-ref](https://github.com/scttfrdmn/ood-pcluster-ref) | Reference ParallelCluster configs + setup scripts for OOD |
+| [aws-role-exec](https://github.com/scttfrdmn/aws-role-exec) | Assume an IAM role and exec a child process with short-lived STS credentials — optional per-job credential scoping (see the adapter guide) |
 | [aws-hubzero](https://github.com/scttfrdmn/aws-hubzero) | Sister project: HubZero on AWS with the same deployment pattern |
 
 ---
