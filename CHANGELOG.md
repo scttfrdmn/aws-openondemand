@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `scripts/userdata.sh` + `terraform/main.tf`: rewrote `broker.yaml` to the oidc-auth-broker
+  v0.3.x nested schema (`server`/`oidc.providers`/`authentication`/`security`/`audit`). The
+  old flat top-level schema was rejected with "at least one OIDC provider must be configured"
+  and the broker crash-looped (#37). Generates a `token_encryption_key` (new
+  `broker_token_key` SSM SecureString) and injects it at boot; added a broker-active boot
+  assertion. Dropped the obsolete dynamodb/uid/home keys (no place in the v0.3.x schema).
+- `scripts/bake.sh`: install and assert `mod_auth_openidc` so OOD's `update_ood_portal`
+  emits the OIDC Apache vhost instead of silently falling back to `need_auth` (#38). Added a
+  matching boot-time warning in `userdata.sh` when the generated `ood-portal.conf` has no
+  OIDC directives.
 - Corrected the oidc-pam integration to match what v0.3.x actually provides
   (scttfrdmn/oidc-pam#87): removed the `/etc/nsswitch.conf` `oidc` wiring (v0.3.x is
   PAM-only — there is no NSS module) and the invalid
