@@ -20,8 +20,11 @@ import * as logs from "aws-cdk-lib/aws-logs";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import * as batch from "aws-cdk-lib/aws-batch";
 import * as sagemaker from "aws-cdk-lib/aws-sagemaker";
+import * as emrserverless from "aws-cdk-lib/aws-emrserverless";
+import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
+import * as cr from "aws-cdk-lib/custom-resources";
 import { Construct } from "constructs";
 import * as crypto from "crypto";
 import * as fs from "fs";
@@ -163,6 +166,11 @@ export class OodStack extends cdk.Stack {
       this.node.tryGetContext("alarmEmail") || "";
     const adaptersEnabled: string[] =
       this.node.tryGetContext("adaptersEnabled") || [];
+    const oidcPamVersion: string =
+      this.node.tryGetContext("oidcPamVersion") || "v0.3.3";
+    if (!/^v[0-9]+\.[0-9]+\.[0-9]+/.test(oidcPamVersion)) {
+      throw new Error(`oidcPamVersion must be a semver tag like v0.3.3 (got "${oidcPamVersion}")`);
+    }
     // H2: cognito_mfa_required=true sets MFA to REQUIRED (ON) instead of OPTIONAL.
     // Set this in cdk.context.json for prod once all users have enrolled TOTP.
     const cognitoMfaRequired =
@@ -246,6 +254,71 @@ export class OodStack extends cdk.Stack {
     sg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.udp(53), "DNS UDP");
     sg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(53), "DNS TCP");
 
+    // --- ALB (created early so its DNS name is the OIDC callback host AND the
+    // ood_portal servername in user_data; listeners + target group attach later). ---
+    // #25: a no-ALB, no-domain Cognito deploy has no stable HTTPS callback — fail fast.
+    if (useCognito && !enableAlb && domainName === "") {
+      throw new Error(
+        "Cognito browser auth requires a stable HTTPS callback URL — set enableAlb=true or provide domainName (an instance IP is not a viable OIDC redirect target)."
+      );
+    }
+    // #33: an ALB requires >=2 AZ subnets; guard explicit single-subnet input.
+    const albSubnetIds: string[] = this.node.tryGetContext("albSubnetIds") || [];
+    if (enableAlb && albSubnetIds.length > 0 && new Set(albSubnetIds).size < 2) {
+      throw new Error(
+        "enable_alb requires at least 2 subnets in different AZs. Provide >=2 distinct albSubnetIds."
+      );
+    }
+    let alb: elbv2.ApplicationLoadBalancer | undefined;
+    let albSg: ec2.SecurityGroup | undefined;
+    if (enableAlb) {
+      albSg = new ec2.SecurityGroup(this, "AlbSG", {
+        vpc,
+        description: `OOD ALB ${props.environment}`,
+        allowAllOutbound: false,
+      });
+      for (const port of [80, 443]) {
+        albSg.addIngressRule(ec2.Peer.ipv4(allowedCidr), ec2.Port.tcp(port), `ALB port ${port}`);
+      }
+      albSg.addEgressRule(sg, ec2.Port.tcp(80), "To EC2 HTTP");
+      sg.addIngressRule(albSg, ec2.Port.tcp(80), "HTTP from ALB");
+      alb = new elbv2.ApplicationLoadBalancer(this, "ALB", {
+        vpc,
+        internetFacing: true,
+        securityGroup: albSg,
+        deletionProtection: props.environment !== "test",
+        ...(albSubnetIds.length > 0
+          ? { vpcSubnets: { subnets: albSubnetIds.map((id, i) => ec2.Subnet.fromSubnetId(this, `AlbSubnet${i}`, id)) } }
+          : {}),
+      });
+
+      // #31: ALB access logs — parity with aws_s3_bucket.alb_logs + access_logs{} in
+      // terraform/main.tf. ALB log delivery is performed by the ELB service account and
+      // only supports SSE-S3 (AES256) — SSE-KMS is rejected — so this bucket is AES256
+      // regardless of enableKmsCmk (same constraint noted in the TF resource). logAccessLogs
+      // attaches the required ELB-service-account bucket policy and the "alb-logs" prefix.
+      const albLogsBucket = new s3.Bucket(this, "AlbLogsBucket", {
+        bucketName: undefined, // let CFN assign a unique name (TF uses bucket_prefix)
+        encryption: s3.BucketEncryption.S3_MANAGED,
+        blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+        enforceSSL: true, // mirrors the DenyHTTP (aws:SecureTransport=false) statement
+        versioned: true, // H5: versioning detects log tampering
+        removalPolicy:
+          props.environment === "prod"
+            ? cdk.RemovalPolicy.RETAIN
+            : cdk.RemovalPolicy.DESTROY,
+        lifecycleRules: [
+          {
+            expiration: cdk.Duration.days(
+              props.environment === "prod" ? 365 : 90
+            ),
+            abortIncompleteMultipartUploadAfter: cdk.Duration.days(7),
+          },
+        ],
+      });
+      alb.logAccessLogs(albLogsBucket, "alb-logs");
+    }
+
     // --- AMI selection ---
     const ami = enablePackerAmi
       ? ec2.MachineImage.lookup({
@@ -289,10 +362,10 @@ export class OodStack extends cdk.Stack {
         removalPolicy: cdk.RemovalPolicy.RETAIN, // M10: always RETAIN — pool contains all user identities
       });
 
-      const callbackUrl =
-        domainName !== ""
-          ? `https://${domainName}/oidc/callback`
-          : "https://localhost/oidc/callback";
+      // #25: domain wins; else the ALB DNS (the precondition above guarantees one exists
+      // when use_cognito). No localhost fallback — it was never a reachable callback.
+      const callbackHost = domainName !== "" ? domainName : alb!.loadBalancerDnsName;
+      const callbackUrl = `https://${callbackHost}/oidc/callback`;
 
       appClient = new cognito.UserPoolClient(this, "AppClient", {
         userPool,
@@ -306,9 +379,7 @@ export class OodStack extends cdk.Stack {
             cognito.OAuthScope.PROFILE,
           ],
           callbackUrls: [callbackUrl],
-          logoutUrls: [
-            domainName !== "" ? `https://${domainName}` : "https://localhost",
-          ],
+          logoutUrls: [`https://${callbackHost}`],
         },
         // M8: Both userPassword and userSrp are intentionally disabled.
         // OOD uses OIDC/OAuth2 via the ALB authenticator — users never authenticate
@@ -331,6 +402,74 @@ export class OodStack extends cdk.Stack {
           parameterName: `/ood/${props.environment}/oidc_client_id`,
           stringValue: oidcClientId,
         });
+
+        // #37: oidc-auth-broker v0.3.x requires security.token_encryption_key (32 raw
+        // bytes, base64-encoded — what `openssl rand -base64 32` yields). userdata.sh
+        // reads /ood/${env}/broker_token_key (SecureString, --with-decryption) into
+        // OOD_BROKER_TOKEN_KEY → broker.yaml. Mirrors aws_ssm_parameter.broker_token_key
+        // in terraform/main.tf, gated on use_cognito && enable_parameter_store.
+        //
+        // CloudFormation's native AWS::SSM::Parameter cannot create a SecureString, so we
+        // PutParameter via a custom resource. DIVERGENCE from Terraform: TF holds the
+        // random value in state and keeps it stable across applies; CDK has no such store,
+        // so the key is re-generated whenever the template is re-synthesized and will
+        // rotate on redeploy. For a token-encryption key this is benign — it only forces
+        // the broker to re-issue session tokens (users re-authenticate), it does not break
+        // the deployment.
+        const brokerTokenKey = crypto.randomBytes(32).toString("base64");
+        const brokerKeyParamName = `/ood/${props.environment}/broker_token_key`;
+        new cr.AwsCustomResource(this, "BrokerTokenKeyParam", {
+          // Stable physical id keyed on the parameter name — the resource maps 1:1 to the
+          // SSM parameter regardless of value churn.
+          resourceType: "Custom::SsmSecureString",
+          onCreate: {
+            service: "SSM",
+            action: "putParameter",
+            parameters: {
+              Name: brokerKeyParamName,
+              Value: brokerTokenKey,
+              Type: "SecureString",
+              Overwrite: true,
+              ...(cmk ? { KeyId: cmk.keyArn } : {}),
+            },
+            physicalResourceId: cr.PhysicalResourceId.of(brokerKeyParamName),
+          },
+          onUpdate: {
+            service: "SSM",
+            action: "putParameter",
+            parameters: {
+              Name: brokerKeyParamName,
+              Value: brokerTokenKey,
+              Type: "SecureString",
+              Overwrite: true,
+              ...(cmk ? { KeyId: cmk.keyArn } : {}),
+            },
+            physicalResourceId: cr.PhysicalResourceId.of(brokerKeyParamName),
+          },
+          onDelete: {
+            service: "SSM",
+            action: "deleteParameter",
+            parameters: { Name: brokerKeyParamName },
+          },
+          policy: cr.AwsCustomResourcePolicy.fromStatements([
+            new iam.PolicyStatement({
+              actions: ["ssm:PutParameter", "ssm:DeleteParameter"],
+              resources: [
+                `arn:aws:ssm:${this.region}:${this.account}:parameter${brokerKeyParamName}`,
+              ],
+            }),
+            // KMS Encrypt is required for SecureString PutParameter under a CMK.
+            ...(cmk
+              ? [
+                  new iam.PolicyStatement({
+                    actions: ["kms:Encrypt", "kms:GenerateDataKey"],
+                    resources: [cmk.keyArn],
+                  }),
+                ]
+              : []),
+          ]),
+          installLatestAwsSdk: false,
+        });
       }
     }
 
@@ -339,7 +478,11 @@ export class OodStack extends cdk.Stack {
     if (enableDynamodbUid) {
       uidTable = new dynamodb.Table(this, "UidMap", {
         tableName: `oid-uid-map-${props.environment}`,
-        partitionKey: { name: "oidc_sub", type: dynamodb.AttributeType.STRING },
+        // #39: keyed on `username` (the only identity the pam_exec provisioning hook
+        // receives). Rows are {username, uid}; a "__uid_counter__" sentinel item holds
+        // next_uid for atomic allocation. (Re-key forces table replacement on an existing
+        // deployment — the table is empty in practice at first wiring.)
+        partitionKey: { name: "username", type: dynamodb.AttributeType.STRING },
         billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
         pointInTimeRecovery: true,
         encryption: enableKmsCmk
@@ -550,6 +693,38 @@ export class OodStack extends cdk.Stack {
       );
     }
 
+    // Standing infra for adapters that need it (EMR Serverless app, ECS Fargate cluster).
+    // Created before the adapter IAM blocks so those blocks can reference the ARNs.
+    // Mirrors aws_emrserverless_application.ood / aws_ecs_cluster.ood in terraform/main.tf.
+    let emrApp: emrserverless.CfnApplication | undefined;
+    if (adaptersEnabled.includes("emr")) {
+      emrApp = new emrserverless.CfnApplication(this, "EmrApp", {
+        name: `ood-${props.environment}`,
+        releaseLabel: "emr-7.0.0",
+        type: "SPARK",
+      });
+      if (enableParameterStore) {
+        new ssm.StringParameter(this, "EmrAppIdParam", {
+          parameterName: `/ood/${props.environment}/emr_application_id`,
+          stringValue: emrApp.attrApplicationId,
+        });
+      }
+    }
+
+    let fargateCluster: ecs.CfnCluster | undefined;
+    if (adaptersEnabled.includes("fargate")) {
+      fargateCluster = new ecs.CfnCluster(this, "FargateCluster", {
+        clusterName: `ood-${props.environment}`,
+        clusterSettings: [{ name: "containerInsights", value: "enabled" }],
+      });
+    }
+
+    // Captured by the Batch / SageMaker adapter blocks below so the stack outputs can
+    // reference their ARNs/IDs (mirrors the batch_job_queue_arn / sagemaker_domain_id
+    // outputs in terraform/outputs.tf).
+    let batchJobQueue: batch.JobQueue | undefined;
+    let sagemakerDomain: sagemaker.CfnDomain | undefined;
+
     // Adapter IAM policies (mutating actions scoped, read-only to "*")
     if (adaptersEnabled.includes("batch")) {
       // Mutating: scoped to job queues and job definitions for this environment
@@ -646,6 +821,143 @@ export class OodStack extends cdk.Stack {
       );
     }
 
+    // --- Omics adapter (mirror aws_iam_role_policy.omics_adapter) ---
+    if (adaptersEnabled.includes("omics")) {
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["omics:StartRun", "omics:GetRun", "omics:CancelRun", "omics:ListRuns"],
+          resources: ["*"],
+        })
+      );
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["iam:PassRole"],
+          resources: ["*"],
+          conditions: { StringEquals: { "iam:PassedToService": "omics.amazonaws.com" } },
+        })
+      );
+    }
+
+    // --- EMR Serverless adapter (mirror aws_iam_role_policy.emr_adapter) ---
+    if (adaptersEnabled.includes("emr") && emrApp) {
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "emr-serverless:StartJobRun",
+            "emr-serverless:GetJobRun",
+            "emr-serverless:CancelJobRun",
+            "emr-serverless:ListJobRuns",
+          ],
+          resources: [emrApp.attrArn, `${emrApp.attrArn}/jobruns/*`],
+        })
+      );
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["iam:PassRole"],
+          resources: ["*"],
+          conditions: { StringEquals: { "iam:PassedToService": "emr-serverless.amazonaws.com" } },
+        })
+      );
+    }
+
+    // --- SageMaker Training adapter (mirror aws_iam_role_policy.sagemaker_training_adapter) ---
+    if (adaptersEnabled.includes("sagemaker-training")) {
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "sagemaker:CreateTrainingJob",
+            "sagemaker:DescribeTrainingJob",
+            "sagemaker:StopTrainingJob",
+            "sagemaker:ListTrainingJobs",
+          ],
+          resources: [`arn:aws:sagemaker:${this.region}:${this.account}:training-job/ood-*`],
+        })
+      );
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["iam:PassRole"],
+          resources: ["*"],
+          conditions: { StringEquals: { "iam:PassedToService": "sagemaker.amazonaws.com" } },
+        })
+      );
+    }
+
+    // --- Fargate adapter (mirror aws_iam_role_policy.fargate_adapter) ---
+    if (adaptersEnabled.includes("fargate") && fargateCluster) {
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["ecs:RunTask", "ecs:StopTask", "ecs:ListTasks"],
+          resources: [
+            fargateCluster.attrArn,
+            `${fargateCluster.attrArn}/task/*`,
+            `arn:aws:ecs:${this.region}:${this.account}:task-definition/*`,
+          ],
+        })
+      );
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["ecs:DescribeTasks"], // requires "*"
+          resources: ["*"],
+        })
+      );
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["iam:PassRole"],
+          resources: ["*"],
+          conditions: { StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" } },
+        })
+      );
+    }
+
+    // --- Step Functions adapter (mirror aws_iam_role_policy.stepfunctions_adapter) ---
+    if (adaptersEnabled.includes("stepfunctions")) {
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["states:StartExecution", "states:StopExecution", "states:ListExecutions"],
+          resources: [`arn:aws:states:${this.region}:${this.account}:stateMachine:ood-*`],
+        })
+      );
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["states:DescribeExecution"],
+          resources: [`arn:aws:states:${this.region}:${this.account}:execution:ood-*:*`],
+        })
+      );
+    }
+
+    // --- Braket adapter (mirror aws_iam_role_policy.braket_adapter) ---
+    if (adaptersEnabled.includes("braket")) {
+      // Quantum-task lifecycle (task ARNs are server-assigned UUIDs under this account).
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          sid: "BraketQuantumTasks",
+          actions: [
+            "braket:CreateQuantumTask",
+            "braket:GetQuantumTask",
+            "braket:CancelQuantumTask",
+            "braket:SearchQuantumTasks",
+          ],
+          resources: [`arn:aws:braket:${this.region}:${this.account}:quantum-task/*`],
+        })
+      );
+      // Device discovery — QPUs/simulators are AWS-owned global resources, need "*".
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          sid: "BraketDevices",
+          actions: ["braket:GetDevice", "braket:SearchDevices"],
+          resources: ["*"],
+        })
+      );
+      // Results bucket (scoped to the ood-* prefix, matching the S3 gateway endpoint).
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          sid: "BraketResultsS3",
+          actions: ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+          resources: ["arn:aws:s3:::ood-*", "arn:aws:s3:::ood-*/*"],
+        })
+      );
+    }
+
     // KMS grant for instance role
     if (enableKmsCmk && cmk) {
       cmk.grantEncryptDecrypt(instanceRole);
@@ -680,12 +992,16 @@ export class OodStack extends cdk.Stack {
     });
 
     // Upload the bootstrap scripts (CDK-native equivalent of aws_s3_object).
+    // ood-provision-user.sh is included only when the UID map is enabled (#39), matching
+    // the count-gated aws_s3_object.provision_user in Terraform.
+    const scriptIncludes = ["**", "!userdata.sh", "!bake.sh"];
+    if (enableDynamodbUid) scriptIncludes.push("!ood-provision-user.sh");
     new s3deploy.BucketDeployment(this, "ArtifactDeployment", {
       destinationBucket: artifactBucket,
       sources: [
         s3deploy.Source.asset(scriptsDir, {
           // Only ship the scripts the stub fetches — not the whole scripts dir.
-          exclude: ["**", "!userdata.sh", "!bake.sh"],
+          exclude: scriptIncludes,
         }),
       ],
       prune: false,
@@ -713,7 +1029,11 @@ export class OodStack extends cdk.Stack {
       `export OOD_S3_BROWSER_BUCKET="${s3BrowserBucket ? s3BrowserBucket.bucketName : ""}"`,
       `export OOD_ADAPTERS_ENABLED='${JSON.stringify(adaptersEnabled)}'`,
       `export OOD_LOG_GROUP_PREFIX="${logGroupPrefix}"`,
-      `ARTIFACT_BUCKET="${artifactBucket.bucketName}"`,
+      `export OOD_ALB_DNS="${alb ? alb.loadBalancerDnsName : ""}"`, // #35
+      `export OOD_OIDC_PAM_VERSION="${oidcPamVersion}"`,
+      `export OOD_DYNAMODB_UID_TABLE="${uidTable ? uidTable.tableName : ""}"`,
+      // #49: export (not bare assign) so the fetched userdata.sh child process inherits it.
+      `export ARTIFACT_BUCKET="${artifactBucket.bucketName}"`,
       // Fetch-verify-exec from S3. The SHA256 is computed at synth time from the
       // exact file uploaded to the bucket, so verification is intrinsic — there
       // is no separate checksum file to drift, and a mismatch hard-fails the boot.
@@ -810,33 +1130,11 @@ export class OodStack extends cdk.Stack {
       },
     });
 
-    // --- ALB + ACM ---
-    let alb: elbv2.ApplicationLoadBalancer | undefined;
+    // --- ALB listeners + ACM (the ALB itself + its SG were created above, before
+    // user_data, so its DNS name is available as the OIDC servername/callback host). ---
     let albCertArn = acmCertificateArn;
 
-    if (enableAlb) {
-      const albSg = new ec2.SecurityGroup(this, "AlbSG", {
-        vpc,
-        description: `OOD ALB ${props.environment}`,
-        allowAllOutbound: false,
-      });
-      for (const port of [80, 443]) {
-        albSg.addIngressRule(
-          ec2.Peer.ipv4(allowedCidr),
-          ec2.Port.tcp(port),
-          `ALB port ${port}`
-        );
-      }
-      albSg.addEgressRule(sg, ec2.Port.tcp(80), "To EC2 HTTP");
-      sg.addIngressRule(albSg, ec2.Port.tcp(80), "HTTP from ALB");
-
-      alb = new elbv2.ApplicationLoadBalancer(this, "ALB", {
-        vpc,
-        internetFacing: true,
-        securityGroup: albSg,
-        deletionProtection: props.environment !== "test",
-      });
-
+    if (enableAlb && alb) {
       const targetGroup = new elbv2.ApplicationTargetGroup(
         this,
         "TargetGroup",
@@ -1147,6 +1445,56 @@ export class OodStack extends cdk.Stack {
       statusAlarm.addAlarmAction(
         new cloudwatchActions.SnsAction(alarmTopic)
       );
+
+      // #22: CloudWatch dashboard — mirrors aws_cloudwatch_dashboard.ood in
+      // terraform/main.tf. CPU widget always present (12x6 at 0,0); EFS ClientConnections
+      // widget (12x6 at 12,0) only when EFS is enabled. Every widget must declare region
+      // and explicit x/y/width/height or PutDashboard rejects the body (400).
+      const dashboardWidgets: object[] = [
+        {
+          type: "metric",
+          x: 0,
+          y: 0,
+          width: 12,
+          height: 6,
+          properties: {
+            title: "CPU Utilization",
+            region: this.region,
+            period: 300,
+            stat: "Average",
+            metrics: [
+              [
+                "AWS/EC2",
+                "CPUUtilization",
+                "AutoScalingGroupName",
+                asg.autoScalingGroupName,
+              ],
+            ],
+          },
+        },
+      ];
+      if (enableEfs && homeFs) {
+        dashboardWidgets.push({
+          type: "metric",
+          x: 12,
+          y: 0,
+          width: 12,
+          height: 6,
+          properties: {
+            title: "EFS Client Connections",
+            region: this.region,
+            period: 300,
+            stat: "Average",
+            metrics: [
+              ["AWS/EFS", "ClientConnections", "FileSystemId", homeFs.fileSystemId],
+            ],
+          },
+        });
+      }
+      new cloudwatch.CfnDashboard(this, "Dashboard", {
+        dashboardName: `ood-${props.environment}`,
+        dashboardBody: JSON.stringify({ widgets: dashboardWidgets }),
+      });
     }
 
     // --- AWS Batch (adapter) ---
@@ -1184,7 +1532,7 @@ export class OodStack extends cdk.Stack {
         }
       );
 
-      new batch.JobQueue(this, "BatchQueue", {
+      batchJobQueue = new batch.JobQueue(this, "BatchQueue", {
         jobQueueName: `ood-${props.environment}`,
         computeEnvironments: [
           { computeEnvironment: computeEnv, order: 1 },
@@ -1240,7 +1588,7 @@ export class OodStack extends cdk.Stack {
         })
       );
 
-      new sagemaker.CfnDomain(this, "SageMakerDomain", {
+      sagemakerDomain = new sagemaker.CfnDomain(this, "SageMakerDomain", {
         domainName: `ood-${props.environment}`,
         authMode: "IAM",
         vpcId: vpc.vpcId,
@@ -1295,6 +1643,43 @@ export class OodStack extends cdk.Stack {
       new cdk.CfnOutput(this, "AlarmTopicArn", {
         value: alarmTopic.topicArn,
         description: "CloudWatch alarm SNS topic",
+      });
+    }
+
+    // Adapter / infra outputs — parity with terraform/outputs.tf. Each is guarded by the
+    // same condition that creates the underlying resource. (CfnOutput has no `sensitive`
+    // flag; the TF `sensitive = true` markers are state-display masks with no CFN analogue.)
+    new cdk.CfnOutput(this, "ArtifactsBucket", {
+      value: artifactBucket.bucketName,
+      description:
+        "Bootstrap artifacts bucket — stage adapter binaries / app bundles here under a prefix (see docs/adapter-guide.md)",
+    });
+
+    if (batchJobQueue) {
+      new cdk.CfnOutput(this, "BatchJobQueueArn", {
+        value: batchJobQueue.jobQueueArn,
+        description: "AWS Batch job queue ARN (Batch adapter)",
+      });
+    }
+
+    if (sagemakerDomain) {
+      new cdk.CfnOutput(this, "SageMakerDomainId", {
+        value: sagemakerDomain.attrDomainId,
+        description: "SageMaker Domain ID (SageMaker adapter)",
+      });
+    }
+
+    if (emrApp) {
+      new cdk.CfnOutput(this, "EmrApplicationId", {
+        value: emrApp.attrApplicationId,
+        description: "EMR Serverless application ID (EMR adapter)",
+      });
+    }
+
+    if (fargateCluster) {
+      new cdk.CfnOutput(this, "EcsClusterArn", {
+        value: fargateCluster.attrArn,
+        description: "ECS cluster ARN for Fargate workloads (Fargate adapter)",
       });
     }
   }
