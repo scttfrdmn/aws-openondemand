@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `scripts/userdata.sh`: add the `auth:` block to the generated `ood_portal.yml` whenever
+  OIDC is configured (#52). ood-portal-generator only emits the mod_auth_openidc vhost when
+  its `auth?` predicate is true (the `auth` list is non-empty); with the list missing, a
+  fully-correct OIDC config (right `oidc_*` keys, loaded module, live broker, ALB-DNS
+  servername) still fell back to the `need_auth` page and nobody could log in. The
+  post-`update_ood_portal` assertion now checks the rendered `ood-portal.conf` carries the
+  `openid-connect` AuthType (not a loose `oidc` substring), so both failure modes — missing
+  module (#38) and missing `auth:` block — are caught loudly. Shared script, so the fix
+  applies to both the Terraform and CDK deploy paths.
 - `terraform/main.tf` + `scripts/userdata.sh`: fixed a `set -u` abort introduced by #39 —
   the provisioning block referenced `${ARTIFACT_BUCKET}`, which the launch-template stub set
   but did not export, so the fetched userdata.sh hit 'unbound variable' and aborted bootstrap
