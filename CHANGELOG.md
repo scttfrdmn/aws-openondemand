@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `terraform/main.tf`: `enable_alb=true` now fails fast at plan unless `alb_subnet_ids`
+  has >=2 subnets in different AZs — an ALB cannot be created in a single AZ, so the prior
+  test-environment single-subnet fallback always failed at `aws_lb` creation with an AWS
+  ValidationError (#33). Applies to all environments; message tells the operator to set
+  `alb_subnet_ids`.
+
+### Fixed
 - `scripts/userdata.sh` + `terraform/main.tf`: rewrote `broker.yaml` to the oidc-auth-broker
   v0.3.x nested schema (`server`/`oidc.providers`/`authentication`/`security`/`audit`). The
   old flat top-level schema was rejected with "at least one OIDC provider must be configured"
