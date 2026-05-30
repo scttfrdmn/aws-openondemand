@@ -1445,7 +1445,7 @@ resource "aws_launch_template" "ood" {
     "export OOD_DOMAIN='${var.domain_name}'",
     "export OOD_ALB_DNS='${var.enable_alb ? aws_lb.ood[0].dns_name : ""}'",
     "export OOD_OIDC_PAM_VERSION='${var.oidc_pam_version}'",
-    "ARTIFACT_BUCKET='${aws_s3_bucket.artifacts.id}'",
+    "export ARTIFACT_BUCKET='${aws_s3_bucket.artifacts.id}'", # exported so the fetched userdata.sh child inherits it (#49)
     ],
     # bake.sh runs at boot only on the base AL2023 AMI; with a pre-baked AMI it was
     # already applied at image build time (matches the CDK base-AMI branch).
