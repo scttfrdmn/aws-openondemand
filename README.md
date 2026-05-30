@@ -204,6 +204,14 @@ terraform init
 terraform apply -var-file=environments/test.tfvars
 ```
 
+> **Browser login requires a stable HTTPS endpoint.** With Cognito
+> (`use_cognito=true`, the default), the OIDC redirect needs a fixed callback
+> URL, so you must set **`enable_alb=true`** *or* provide a **`domain_name`**.
+> A no-ALB, no-domain deployment has no working portal login — an ephemeral
+> instance public IP can't serve as a reliable OIDC redirect target — so
+> `terraform plan` fails fast with that guidance rather than producing an
+> unusable portal.
+
 ### CDK
 
 ```bash

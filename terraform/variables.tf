@@ -167,10 +167,10 @@ variable "enable_cloudwatch_accounting" {
 variable "adapters_enabled" {
   type        = list(string)
   default     = []
-  description = "Compute backends to wire up: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions. Infrastructure (IAM, queues, domains) is created per entry."
+  description = "Compute backends to wire up: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket. Infrastructure (IAM, queues, domains) is created per entry."
   validation {
-    condition     = alltrue([for a in var.adapters_enabled : contains(["batch", "sagemaker", "sagemaker-training", "ec2", "omics", "emr", "fargate", "stepfunctions"], a)])
-    error_message = "adapters_enabled entries must be one of: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions."
+    condition     = alltrue([for a in var.adapters_enabled : contains(["batch", "sagemaker", "sagemaker-training", "ec2", "omics", "emr", "fargate", "stepfunctions", "braket"], a)])
+    error_message = "adapters_enabled entries must be one of: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket."
   }
 }
 
@@ -260,6 +260,16 @@ variable "enable_packer_ami" {
   type        = bool
   default     = true
   description = "Use a pre-baked OOD AMI (ood-base-*) when available; falls back to AL2023 base AMI. Reduces bootstrap from 10-15 min to 3-5 min."
+}
+
+variable "oidc_pam_version" {
+  type        = string
+  default     = "v0.3.1"
+  description = "oidc-pam release tag the baked AMI ships. userdata.sh uses it as a runtime fallback to install oidc-pam/oidc-auth-broker at boot if the AMI is missing the binary (#26). Should match the version baked via packer's oidc_pam_version."
+  validation {
+    condition     = can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+", var.oidc_pam_version))
+    error_message = "oidc_pam_version must be a semantic version tag starting with 'v' (e.g. v0.3.1)."
+  }
 }
 
 variable "enable_parameter_store" {

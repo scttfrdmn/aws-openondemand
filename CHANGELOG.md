@@ -8,10 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `scripts/userdata.sh`: SSM Parameter Store values are no longer lost to a pipe
+  subshell — the `OOD_*` assignments now persist, so the oidc-auth-broker is actually
+  configured and started (#24).
+- `scripts/userdata.sh`: open http/https in firewalld at boot — the AMI ships firewalld
+  active, so without this the portal was unreachable (`ERR_CONNECTION_REFUSED`) despite
+  httpd listening (#29).
+- `scripts/userdata.sh` + `terraform`: runtime fallback to install oidc-pam/
+  oidc-auth-broker at boot (checksum-verified, via new `oidc_pam_version` variable) when
+  the baked AMI is missing the binary, so cloud-native OIDC→PAM identity works regardless
+  of AMI vintage (#26).
+- `terraform/main.tf`: fail fast at plan when `use_cognito && !enable_alb && domain_name==""` —
+  a no-ALB/no-domain deploy has no stable OIDC callback and produced a portal with no
+  working browser login. Removed the misleading `localhost` callback fallback (#25).
 - `terraform/main.tf`: CloudWatch dashboard apply no longer fails with
   `enable_monitoring = true` (#22). Metric widgets now declare the required `region`
   and explicit `x`/`y`/`width`/`height` layout, and the EFS widget is omitted entirely
   (rather than emitted with an empty `metrics` array) when `enable_efs = false`.
+
+### Added
+- braket compute backend fully wired: `adapters_enabled` accepts `braket`, with a scoped
+  IAM policy (`braket:*QuantumTask*` + device discovery + results S3) and an `aws-braket.yml`
+  OOD cluster generator. Pairs with the `aws-braket` app bundle in ood-apps (#28).
 
 ### Security
 - `terraform/main.tf`: enabled `drop_invalid_header_fields` on the ALB and added
