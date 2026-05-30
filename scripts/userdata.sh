@@ -35,29 +35,35 @@ if [ "${OOD_ENABLE_PARAMETER_STORE}" = "true" ]; then
   echo "=== Sourcing config from SSM /ood/${OOD_ENVIRONMENT}/ ==="
   SSM_PATH="/ood/${OOD_ENVIRONMENT}"
 
+  # Fetch to a temp file first, then loop with process substitution. A
+  # `aws ... | while read` pipe runs the loop body in a SUBSHELL, so every OOD_*
+  # assignment would be discarded on subshell exit and the OIDC broker block below
+  # would never run (#24). Reading via `< <(...)` keeps the loop in this shell.
+  SSM_DUMP=$(mktemp)
   if aws ssm get-parameters-by-path \
         --region "${AWS_REGION}" \
         --path "${SSM_PATH}" \
         --with-decryption \
         --query 'Parameters[*].[Name,Value]' \
-        --output text 2>/dev/null | \
-      while IFS=$'\t' read -r name value; do
-          key="${name##*/}"
-          case "${key}" in
-              domain_name)           OOD_DOMAIN="${value}" ;;
-              efs_id)                OOD_EFS_ID="${value}" ;;
-              efs_access_point_id)   OOD_EFS_ACCESS_POINT_ID="${value}" ;;
-              dynamodb_uid_table)    OOD_DYNAMODB_UID_TABLE="${value}" ;;
-              oidc_client_id)         OOD_OIDC_CLIENT_ID="${value}" ;;
-              oidc_client_secret_arn) OOD_OIDC_CLIENT_SECRET_ARN="${value}" ;; # H2: ARN pointer only
-              oidc_issuer_url)        OOD_OIDC_ISSUER_URL="${value}" ;;
-              redis_endpoint)        OOD_REDIS_ENDPOINT="${value}" ;;
-          esac
-      done; then
+        --output text >"${SSM_DUMP}" 2>/dev/null; then
+    while IFS=$'\t' read -r name value; do
+      key="${name##*/}"
+      case "${key}" in
+        domain_name) OOD_DOMAIN="${value}" ;;
+        efs_id) OOD_EFS_ID="${value}" ;;
+        efs_access_point_id) OOD_EFS_ACCESS_POINT_ID="${value}" ;;
+        dynamodb_uid_table) OOD_DYNAMODB_UID_TABLE="${value}" ;;
+        oidc_client_id) OOD_OIDC_CLIENT_ID="${value}" ;;
+        oidc_client_secret_arn) OOD_OIDC_CLIENT_SECRET_ARN="${value}" ;; # H2: ARN pointer only
+        oidc_issuer_url) OOD_OIDC_ISSUER_URL="${value}" ;;
+        redis_endpoint) OOD_REDIS_ENDPOINT="${value}" ;;
+      esac
+    done <"${SSM_DUMP}"
     echo "=== SSM parameters loaded ==="
   else
     echo "WARNING: SSM parameter load failed — using Terraform-injected defaults"
   fi
+  rm -f "${SSM_DUMP}"
 fi
 
 # Fallback defaults for SSM-sourced vars
@@ -143,6 +149,42 @@ fi
 ###############################################################################
 # 3. Configure oidc-auth-broker (reads from /etc/oidc-auth/broker.yaml)
 ###############################################################################
+# Runtime fallback (#26): the baked AMI is expected to ship oidc-pam (installed by
+# bake.sh), but older/partial AMIs may lack the oidc-auth-broker binary, leaving the
+# systemd unit pointing at a missing ExecStart. If it's absent, install oidc-pam now
+# using the same download + checksum-verify + fail-closed logic as bake.sh. This makes
+# userdata self-healing regardless of AMI vintage. (Durable fix is also rebuilding the
+# AMI, which is out-of-band Packer infra.)
+if [ -n "${OOD_OIDC_CLIENT_ID}" ] && [ -n "${OOD_OIDC_ISSUER_URL}" ] && [ ! -x /usr/local/bin/oidc-auth-broker ]; then
+  echo "=== oidc-auth-broker binary missing — installing oidc-pam ${OOD_OIDC_PAM_VERSION:-} at boot ==="
+  if [ -z "${OOD_OIDC_PAM_VERSION:-}" ]; then
+    echo "WARNING: OOD_OIDC_PAM_VERSION not set — cannot install oidc-pam at boot; broker will not start"
+  else
+    case "$(uname -m)" in
+      x86_64) _OIDC_ARCH="amd64" ;;
+      aarch64) _OIDC_ARCH="arm64" ;;
+      *) _OIDC_ARCH="$(uname -m)" ;;
+    esac
+    _OIDC_BASE="https://github.com/scttfrdmn/oidc-pam/releases/download/${OOD_OIDC_PAM_VERSION}"
+    _OIDC_TMP=$(mktemp -d)
+    if curl -fsSL "${_OIDC_BASE}/oidc-pam_linux_${_OIDC_ARCH}.tar.gz" -o "${_OIDC_TMP}/oidc-pam.tar.gz" &&
+      curl -fsSL "${_OIDC_BASE}/checksums.txt" -o "${_OIDC_TMP}/checksums.txt"; then
+      _OIDC_EXP=$(grep "oidc-pam_linux_${_OIDC_ARCH}.tar.gz" "${_OIDC_TMP}/checksums.txt" | awk '{print $1}')
+      _OIDC_ACT=$(sha256sum "${_OIDC_TMP}/oidc-pam.tar.gz" | awk '{print $1}')
+      if [ -n "${_OIDC_EXP}" ] && [ "${_OIDC_EXP}" = "${_OIDC_ACT}" ]; then
+        tar -xz -C /usr/local/bin/ -f "${_OIDC_TMP}/oidc-pam.tar.gz"
+        chmod 755 /usr/local/bin/oidc-pam /usr/local/bin/oidc-auth-broker 2>/dev/null || true
+        echo "=== oidc-pam ${OOD_OIDC_PAM_VERSION} installed at boot (checksum ${_OIDC_ACT}) ==="
+      else
+        echo "ERROR: oidc-pam checksum mismatch at boot — not installing (supply chain safety)"
+      fi
+    else
+      echo "ERROR: failed to download oidc-pam ${OOD_OIDC_PAM_VERSION} at boot"
+    fi
+    rm -rf "${_OIDC_TMP}"
+  fi
+fi
+
 if [ -n "${OOD_OIDC_CLIENT_ID}" ] && [ -n "${OOD_OIDC_ISSUER_URL}" ]; then
   echo "=== Configuring oidc-auth-broker ==="
 
@@ -421,6 +463,26 @@ v2:
 SFNCONF
 fi
 
+# Braket adapter cluster config
+if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('braket' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
+  echo "=== Configuring Braket cluster ==="
+  cat > /etc/ood/config/clusters.d/aws-braket.yml <<BRAKETCONF
+---
+v2:
+  metadata:
+    title: "AWS Braket"
+    hidden: false
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/lib/ood-adapters/ood-braket-adapter"
+      args:
+        - submit
+        - "--region=${AWS_REGION}"
+BRAKETCONF
+fi
+
 ###############################################################################
 # 6. Configure PUN session cache (ElastiCache Redis, Level 5)
 ###############################################################################
@@ -454,6 +516,17 @@ systemctl start oidc-auth-broker 2>/dev/null || true
 
 # OOD 4.x on AL2023 uses httpd.service with drop-in configs from the ondemand package
 systemctl enable --now httpd || true
+
+# Open the portal ports in the host firewall. The AMI ships with firewalld active
+# (default public zone allows only ssh/mdns/dhcpv6), so without this httpd listens
+# but every external connection is refused with a TCP RST (#29). The security group
+# remains the primary network control; this just stops the host firewall from
+# silently blocking 80/443. Idempotent — safe to re-run on every boot.
+if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+  echo "=== Opening http/https in firewalld ==="
+  firewall-cmd --permanent --add-service=http --add-service=https
+  firewall-cmd --reload
+fi
 
 fail2ban-client start 2>/dev/null || systemctl start fail2ban || true
 

@@ -71,6 +71,7 @@ locals {
   enable_sagemaker_training = contains(var.adapters_enabled, "sagemaker-training")
   enable_fargate            = contains(var.adapters_enabled, "fargate")
   enable_stepfunctions      = contains(var.adapters_enabled, "stepfunctions")
+  enable_braket             = contains(var.adapters_enabled, "braket")
 
   # Precondition: spot profile requires cloud-native stack
   # (enforced below via lifecycle precondition on the ASG)
@@ -715,17 +716,20 @@ resource "aws_cognito_user_pool_client" "ood" {
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_scopes                 = ["openid", "email", "profile"]
 
+  # A stable HTTPS callback is required for the OIDC code flow. The precondition
+  # below guarantees either a domain or an ALB exists, so these branches always
+  # resolve to a real, reachable host (no localhost fallback — see #25).
   callback_urls = var.domain_name != "" ? [
     "https://${var.domain_name}/oidc/callback"
-    ] : var.enable_alb ? [
+    ] : [
     "https://${aws_lb.ood[0].dns_name}/oidc/callback"
-  ] : ["https://localhost/oidc/callback"]
+  ]
 
   logout_urls = var.domain_name != "" ? [
     "https://${var.domain_name}"
-    ] : var.enable_alb ? [
+    ] : [
     "https://${aws_lb.ood[0].dns_name}"
-  ] : ["https://localhost"]
+  ]
 
   supported_identity_providers = var.cognito_saml_metadata_url != "" ? [
     "COGNITO",
@@ -735,6 +739,18 @@ resource "aws_cognito_user_pool_client" "ood" {
   ]
 
   explicit_auth_flows = ["ALLOW_REFRESH_TOKEN_AUTH"]
+
+  lifecycle {
+    # #25: a no-ALB, no-domain deployment has no stable HTTPS endpoint to serve as
+    # the OIDC redirect target — the portal would come up with no working browser
+    # login. An ephemeral instance public IP is not viable (changes on every
+    # replacement, no TLS cert). Fail fast at plan with actionable guidance rather
+    # than producing a portal nobody can log into.
+    precondition {
+      condition     = !(var.use_cognito && !var.enable_alb && var.domain_name == "")
+      error_message = "Cognito browser auth requires a stable HTTPS callback URL. Set enable_alb=true, or provide domain_name. A no-ALB, no-domain deployment has no working portal login (the instance public IP cannot serve as a reliable OIDC redirect target)."
+    }
+  }
 }
 
 resource "aws_cognito_identity_provider" "saml" {
@@ -1388,6 +1404,7 @@ resource "aws_launch_template" "ood" {
     "export OOD_ADAPTERS_ENABLED='${jsonencode(var.adapters_enabled)}'",
     "export OOD_LOG_GROUP_PREFIX='/aws/ec2/ood-${var.environment}'",
     "export OOD_DOMAIN='${var.domain_name}'",
+    "export OOD_OIDC_PAM_VERSION='${var.oidc_pam_version}'",
     "ARTIFACT_BUCKET='${aws_s3_bucket.artifacts.id}'",
     ],
     # bake.sh runs at boot only on the base AL2023 AMI; with a pre-baked AMI it was
@@ -2992,6 +3009,59 @@ resource "aws_iam_role_policy" "stepfunctions_adapter" {
         Action = ["states:DescribeExecution"]
         Resource = [
           "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:execution:ood-*:*",
+        ]
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Braket adapter (conditional on adapters_enabled containing "braket")
+# ---------------------------------------------------------------------------
+resource "aws_iam_role_policy" "braket_adapter" {
+  count       = local.enable_braket ? 1 : 0
+  name_prefix = "ood-braket-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Quantum-task lifecycle. Task ARNs are server-assigned UUIDs under this
+        # account, so they cannot be prefix-scoped to ood-*; scope to the account's
+        # quantum-task namespace in-region.
+        Sid    = "BraketQuantumTasks"
+        Effect = "Allow"
+        Action = [
+          "braket:CreateQuantumTask",
+          "braket:GetQuantumTask",
+          "braket:CancelQuantumTask",
+          "braket:SearchQuantumTasks",
+        ]
+        Resource = [
+          "arn:aws:braket:${var.aws_region}:${data.aws_caller_identity.current.account_id}:quantum-task/*",
+        ]
+      },
+      {
+        # Device discovery/selection. QPU and simulator devices are AWS-owned global
+        # resources (ARNs carry no account id), so these actions require "*".
+        Sid    = "BraketDevices"
+        Effect = "Allow"
+        Action = [
+          "braket:GetDevice",
+          "braket:SearchDevices",
+        ]
+        Resource = ["*"]
+      },
+      {
+        # Braket writes task results to the caller-specified output bucket; the
+        # adapter also reads them back. Scope to the ood-* bucket prefix (matches
+        # the S3 gateway endpoint policy).
+        Sid    = "BraketResultsS3"
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
+        Resource = [
+          "arn:aws:s3:::ood-*",
+          "arn:aws:s3:::ood-*/*",
         ]
       },
     ]
