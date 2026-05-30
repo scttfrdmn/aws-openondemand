@@ -4,7 +4,7 @@
 # is actually enforced. Review these before each Checkov version upgrade
 # to confirm suppressions are still valid.
 #
-# Last reviewed: 2026-03-20
+# Last reviewed: 2026-05-29
 
 skip-check:
   # CKV_AWS_79: Ensure Instance Metadata Service Version 1 is not enabled
@@ -13,3 +13,12 @@ skip-check:
   # Checkov's static analyzer cannot detect metadata_options nested inside
   # a dynamic launch template block. Verified manually and in deploy tests.
   - CKV_AWS_79
+
+  # CKV_AWS_144: Ensure that S3 bucket has cross-region replication enabled
+  # Suppression reason: cross-region replication is a deliberate non-goal for
+  # this project. It is overkill for an OOD portal — the buckets hold portal
+  # config, logs, SSM session transcripts, and rebuildable bootstrap artifacts,
+  # none of which warrant the cost and operational complexity of multi-region
+  # DR. No replication is configured on any bucket by design. Revisit only if a
+  # specific deployment has a documented multi-region durability requirement.
+  - CKV_AWS_144
