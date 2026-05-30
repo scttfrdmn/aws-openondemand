@@ -2409,12 +2409,20 @@ resource "aws_cloudwatch_dashboard" "ood" {
   count          = var.enable_monitoring ? 1 : 0
   dashboard_name = "ood-${var.environment}"
 
+  # Every metric widget must declare `region` and explicit x/y/width/height layout
+  # coordinates, or CloudWatch rejects the dashboard body (PutDashboard 400). The EFS
+  # widget is only emitted when enable_efs=true — an empty metrics array is also invalid.
   dashboard_body = jsonencode({
-    widgets = [
+    widgets = concat([
       {
-        type = "metric"
+        type   = "metric"
+        x      = 0
+        y      = 0
+        width  = 12
+        height = 6
         properties = {
           title  = "CPU Utilization"
+          region = var.aws_region
           period = 300
           stat   = "Average"
           metrics = [[
@@ -2422,20 +2430,26 @@ resource "aws_cloudwatch_dashboard" "ood" {
             "AutoScalingGroupName", aws_autoscaling_group.ood.name
           ]]
         }
-      },
+      }
+      ], var.enable_efs ? [
       {
-        type = "metric"
+        type   = "metric"
+        x      = 12
+        y      = 0
+        width  = 12
+        height = 6
         properties = {
           title  = "EFS Client Connections"
+          region = var.aws_region
           period = 300
           stat   = "Average"
-          metrics = var.enable_efs ? [[
+          metrics = [[
             "AWS/EFS", "ClientConnections",
             "FileSystemId", aws_efs_file_system.home[0].id
-          ]] : []
+          ]]
         }
-      },
-    ]
+      }
+    ] : [])
   })
 }
 
