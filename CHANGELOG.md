@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `terraform/main.tf`: CloudWatch dashboard apply no longer fails with
+  `enable_monitoring = true` (#22). Metric widgets now declare the required `region`
+  and explicit `x`/`y`/`width`/`height` layout, and the EFS widget is omitted entirely
+  (rather than emitted with an empty `metrics` array) when `enable_efs = false`.
+
 ### Security
 - `terraform/main.tf`: enabled `drop_invalid_header_fields` on the ALB and added
   `abort_incomplete_multipart_upload` + noncurrent-version expiration lifecycle rules
