@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Corrected the oidc-pam integration to match what v0.3.x actually provides
+  (scttfrdmn/oidc-pam#87): removed the `/etc/nsswitch.conf` `oidc` wiring (v0.3.x is
+  PAM-only — there is no NSS module) and the invalid
+  `user_map_cmd: /usr/local/bin/oidc-pam map-user` (no such binary; identity maps via
+  `oidc_remote_user_claim` in the Apache/mod_auth_openidc layer). Kept the `pam_oidc.so`
+  PAM stack. Bumped default `oidc_pam_version` to v0.3.3. Local-account provisioning
+  (which NSS previously implied) is tracked as a separate issue.
 - `scripts/userdata.sh` + `scripts/bake.sh`: corrected the oidc-pam download so the
   `oidc-auth-broker` binary actually installs (#34). The release assets are
   `oidc-pam-<ver>-linux-<arch>.tar.gz` with a per-asset `.sha256` sidecar (not
