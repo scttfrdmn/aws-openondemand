@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `terraform/main.tf` + `scripts/userdata.sh`: fixed a `set -u` abort introduced by #39 —
+  the provisioning block referenced `${ARTIFACT_BUCKET}`, which the launch-template stub set
+  but did not export, so the fetched userdata.sh hit 'unbound variable' and aborted bootstrap
+  before the broker unit and ood_portal.yml (#49). Export ARTIFACT_BUCKET in the stub and
+  guard the reference (`:-`) so a missing value warns instead of failing the boot.
 - `packer/ood.pkr.hcl`: `associate_public_ip_address` is now a `build_public_ip` variable
   (default false) instead of a hardcoded false (#45). IGW-only/default VPCs (single public
   subnet, no NAT) can pass `-var build_public_ip=true` to bake the AMI from a host outside

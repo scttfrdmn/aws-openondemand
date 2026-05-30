@@ -258,9 +258,14 @@ BROKERCONF
   # Install the account-provisioning helper from the artifact bucket (#39). It allocates a
   # stable UID from the DynamoDB UID map and runs useradd on first login. Only meaningful
   # when the UID map is enabled; the helper no-ops if OOD_DYNAMODB_UID_TABLE is empty.
-  if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
+  # ARTIFACT_BUCKET is exported by the launch-template stub; guard with :- so a missing
+  # value warns instead of aborting the whole bootstrap under set -u (#49) — this block is
+  # only a "session optional" convenience, never worth failing the boot over.
+  if [ -n "${OOD_DYNAMODB_UID_TABLE}" ] && [ -n "${ARTIFACT_BUCKET:-}" ]; then
     aws s3 cp "s3://${ARTIFACT_BUCKET}/ood-provision-user.sh" /usr/local/bin/ood-provision-user \
       --region "${AWS_REGION}" && chmod 0755 /usr/local/bin/ood-provision-user
+  elif [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
+    echo "WARNING: ARTIFACT_BUCKET unset — skipping ood-provision-user install; first-login account provisioning unavailable (#49)"
   fi
 
   # Configure PAM for OOD authentication. Order matters: pam_oidc authenticates, then the
