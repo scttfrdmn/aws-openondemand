@@ -909,6 +909,15 @@ resource "aws_elasticache_replication_group" "ood" {
   }
 }
 
+# #37: oidc-auth-broker v0.3.x requires security.token_encryption_key (a 32-byte
+# base64 key). Generate it here and stash in SSM SecureString; userdata.sh injects it
+# into broker.yaml at boot. 32 raw bytes → base64 is what `openssl rand -base64 32` yields.
+resource "random_password" "broker_token_key" {
+  count   = var.use_cognito ? 1 : 0
+  length  = 32
+  special = false # base64-encoded in userdata; keep the raw value alphanumeric-safe
+}
+
 resource "random_password" "redis_auth" {
   count   = var.enable_session_cache ? 1 : 0
   length  = 64 # ElastiCache supports up to 128 chars; 64 provides >380 bits of entropy
@@ -1333,6 +1342,16 @@ resource "aws_ssm_parameter" "redis_auth_token" {
   name   = "/ood/${var.environment}/redis_auth_token"
   type   = "SecureString"
   value  = random_password.redis_auth[0].result
+  key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+}
+
+# #37: token_encryption_key for oidc-auth-broker, base64-encoded (openssl rand -base64 32
+# equivalent). userdata.sh reads this and writes it into broker.yaml security block.
+resource "aws_ssm_parameter" "broker_token_key" {
+  count  = var.enable_parameter_store && var.use_cognito ? 1 : 0
+  name   = "/ood/${var.environment}/broker_token_key"
+  type   = "SecureString"
+  value  = base64encode(random_password.broker_token_key[0].result)
   key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
 }
 

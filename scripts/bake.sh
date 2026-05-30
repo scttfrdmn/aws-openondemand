@@ -65,8 +65,29 @@ if [ -z "${OOD_VERSION:-}" ]; then
 fi
 dnf -y install "ondemand-${OOD_VERSION}"
 
+# #38: OOD's web auth uses the Apache mod_auth_openidc module. ood-portal-generator
+# silently degrades to the need_auth fallback if it isn't loadable, so a portal with a
+# correct ood_portal.yml still can't do OIDC. Install it explicitly. mod_auth_openidc is
+# not in the AL2023 core repos; the ondemand RPM repo (enabled by ondemand-release above)
+# ships it for the OOD platforms. If a future AMI base drops it from that repo, switch to
+# the pinned OpenIDC EL9 release RPM (+ cjose) following the oidc-pam install pattern.
+if dnf -y install mod_auth_openidc; then
+  echo "=== mod_auth_openidc installed ==="
+else
+  echo "FATAL: mod_auth_openidc not available from configured repos — OOD web OIDC will fall back to need_auth (#38)."
+  echo "       Provide it via the ondemand repo or a pinned OpenIDC EL9 RPM, then re-bake."
+  exit 1
+fi
+
 # Enable OOD services (OOD 4.x on AL2023 uses httpd.service with drop-in configs)
 systemctl enable httpd || true
+
+# Assert the module is loadable now, so a bad install fails the bake rather than
+# producing an AMI that silently can't authenticate.
+if ! httpd -M 2>/dev/null | grep -q auth_openidc; then
+  echo "FATAL: mod_auth_openidc installed but not loaded by httpd — aborting AMI bake (#38)"
+  exit 1
+fi
 
 # Create OOD directory structure expected at bake time
 mkdir -p /etc/ood/config/clusters.d \

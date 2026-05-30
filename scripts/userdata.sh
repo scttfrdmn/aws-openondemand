@@ -57,6 +57,7 @@ if [ "${OOD_ENABLE_PARAMETER_STORE}" = "true" ]; then
         oidc_client_secret_arn) OOD_OIDC_CLIENT_SECRET_ARN="${value}" ;; # H2: ARN pointer only
         oidc_issuer_url) OOD_OIDC_ISSUER_URL="${value}" ;;
         redis_endpoint) OOD_REDIS_ENDPOINT="${value}" ;;
+        broker_token_key) OOD_BROKER_TOKEN_KEY="${value}" ;; # #37: broker token_encryption_key
       esac
     done <"${SSM_DUMP}"
     echo "=== SSM parameters loaded ==="
@@ -71,6 +72,7 @@ OOD_DYNAMODB_UID_TABLE="${OOD_DYNAMODB_UID_TABLE:-}"
 OOD_OIDC_CLIENT_ID="${OOD_OIDC_CLIENT_ID:-}"
 OOD_OIDC_CLIENT_SECRET_ARN="${OOD_OIDC_CLIENT_SECRET_ARN:-}"
 OOD_OIDC_ISSUER_URL="${OOD_OIDC_ISSUER_URL:-}"
+OOD_BROKER_TOKEN_KEY="${OOD_BROKER_TOKEN_KEY:-}"
 
 # Fetch OIDC client secret from Secrets Manager (never stored in SSM or userdata) (H2)
 OOD_OIDC_CLIENT_SECRET=""
@@ -202,15 +204,48 @@ fi
 if [ -n "${OOD_OIDC_CLIENT_ID}" ] && [ -n "${OOD_OIDC_ISSUER_URL}" ]; then
   echo "=== Configuring oidc-auth-broker ==="
 
+  # #37: oidc-auth-broker v0.3.x requires the nested schema (server/oidc.providers/
+  # authentication/security/audit). The old flat top-level issuer/client_id/... was
+  # rejected with "at least one OIDC provider must be configured". The UID/home/dynamodb
+  # keys have no place in this schema — local-account provisioning is separate (see #39).
   cat > /etc/oidc-auth/broker.yaml <<BROKERCONF
-issuer: "${OOD_OIDC_ISSUER_URL}"
-client_id: "${OOD_OIDC_CLIENT_ID}"
-client_secret: "${OOD_OIDC_CLIENT_SECRET}"
-dynamodb_table: "${OOD_DYNAMODB_UID_TABLE}"
-aws_region: "${AWS_REGION}"
-uid_range_min: 10000
-uid_range_max: 60000
-home_dir_prefix: /home
+server:
+  socket_path: "/var/run/oidc-auth/broker.sock"
+  log_level: "info"
+  audit_log: "/var/log/oidc-auth/audit.log"
+
+oidc:
+  providers:
+    - name: "cognito"
+      issuer: "${OOD_OIDC_ISSUER_URL}"
+      client_id: "${OOD_OIDC_CLIENT_ID}"
+      client_secret: "${OOD_OIDC_CLIENT_SECRET}"
+      scopes: ["openid", "email", "profile"]
+      user_mapping:
+        username_claim: "preferred_username"
+        email_claim: "email"
+        name_claim: "name"
+      priority: 1
+      enabled_for_login: true
+      verification_only: false
+
+authentication:
+  token_lifetime: "8h"
+  refresh_threshold: "1h"
+  # No group gate by default: Cognito user pools carry no 'groups' claim unless
+  # configured. Institutions federating SAML/groups can require specific groups here.
+  require_groups: []
+
+security:
+  audit_enabled: true
+  require_pkce: true
+  verify_audience: true
+  clock_skew_tolerance: "5m"
+  token_encryption_key: "${OOD_BROKER_TOKEN_KEY}"
+
+audit:
+  enabled: true
+  format: "json"
 BROKERCONF
   chmod 600 /etc/oidc-auth/broker.yaml
 
@@ -247,7 +282,15 @@ SVCCONF
   systemctl daemon-reload
   systemctl enable oidc-auth-broker
   systemctl start oidc-auth-broker
-  echo "=== oidc-auth-broker started ==="
+  # #37: fail loudly if the broker is crash-looping (e.g. a rejected config) rather
+  # than leaving a silently-broken portal. Give it a moment to settle first.
+  sleep 3
+  if systemctl is-active --quiet oidc-auth-broker; then
+    echo "=== oidc-auth-broker started ==="
+  else
+    echo "ERROR: oidc-auth-broker is not active after start — check 'journalctl -u oidc-auth-broker'"
+    journalctl -u oidc-auth-broker --no-pager -n 20 2>/dev/null || true
+  fi
 fi
 
 ###############################################################################
@@ -283,6 +326,12 @@ OODPORTAL
   # Regenerate OOD Apache config from the portal YAML
   if command -v /opt/ood/ood-portal-generator/sbin/update_ood_portal &>/dev/null; then
     /opt/ood/ood-portal-generator/sbin/update_ood_portal
+    # #38: the generator silently degrades to the need_auth fallback if
+    # mod_auth_openidc isn't loadable. Warn loudly so a missing module on an older AMI
+    # is visible instead of a portal stuck on "you need to setup authentication".
+    if ! grep -qi "oidc" /etc/httpd/conf.d/ood-portal.conf 2>/dev/null; then
+      echo "ERROR: ood-portal.conf has no OIDC directives — mod_auth_openidc likely not installed (#38). Web login will fail."
+    fi
   fi
 fi
 
