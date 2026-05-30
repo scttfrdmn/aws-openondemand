@@ -165,21 +165,35 @@ if [ -n "${OOD_OIDC_CLIENT_ID}" ] && [ -n "${OOD_OIDC_ISSUER_URL}" ] && [ ! -x /
       aarch64) _OIDC_ARCH="arm64" ;;
       *) _OIDC_ARCH="$(uname -m)" ;;
     esac
+    # Real release asset naming (#34): oidc-pam-<ver>-linux-<arch>.tar.gz with a
+    # per-asset <asset>.sha256 sidecar (format: "<hash>  <filename>"). The tarball
+    # extracts to a versioned subdir, so place the binaries explicitly afterward.
+    # NOTE: keep this in sync with the identical install logic in scripts/bake.sh.
     _OIDC_BASE="https://github.com/scttfrdmn/oidc-pam/releases/download/${OOD_OIDC_PAM_VERSION}"
+    _OIDC_ASSET="oidc-pam-${OOD_OIDC_PAM_VERSION}-linux-${_OIDC_ARCH}.tar.gz"
+    _OIDC_DIR="oidc-pam-${OOD_OIDC_PAM_VERSION}-linux-${_OIDC_ARCH}"
     _OIDC_TMP=$(mktemp -d)
-    if curl -fsSL "${_OIDC_BASE}/oidc-pam_linux_${_OIDC_ARCH}.tar.gz" -o "${_OIDC_TMP}/oidc-pam.tar.gz" &&
-      curl -fsSL "${_OIDC_BASE}/checksums.txt" -o "${_OIDC_TMP}/checksums.txt"; then
-      _OIDC_EXP=$(grep "oidc-pam_linux_${_OIDC_ARCH}.tar.gz" "${_OIDC_TMP}/checksums.txt" | awk '{print $1}')
-      _OIDC_ACT=$(sha256sum "${_OIDC_TMP}/oidc-pam.tar.gz" | awk '{print $1}')
+    if curl -fsSL "${_OIDC_BASE}/${_OIDC_ASSET}" -o "${_OIDC_TMP}/${_OIDC_ASSET}" &&
+      curl -fsSL "${_OIDC_BASE}/${_OIDC_ASSET}.sha256" -o "${_OIDC_TMP}/${_OIDC_ASSET}.sha256"; then
+      _OIDC_EXP=$(awk '{print $1}' "${_OIDC_TMP}/${_OIDC_ASSET}.sha256")
+      _OIDC_ACT=$(sha256sum "${_OIDC_TMP}/${_OIDC_ASSET}" | awk '{print $1}')
       if [ -n "${_OIDC_EXP}" ] && [ "${_OIDC_EXP}" = "${_OIDC_ACT}" ]; then
-        tar -xz -C /usr/local/bin/ -f "${_OIDC_TMP}/oidc-pam.tar.gz"
-        chmod 755 /usr/local/bin/oidc-pam /usr/local/bin/oidc-auth-broker 2>/dev/null || true
-        echo "=== oidc-pam ${OOD_OIDC_PAM_VERSION} installed at boot (checksum ${_OIDC_ACT}) ==="
+        tar -xz -C "${_OIDC_TMP}" -f "${_OIDC_TMP}/${_OIDC_ASSET}"
+        install -m 0755 "${_OIDC_TMP}/${_OIDC_DIR}/oidc-auth-broker" /usr/local/bin/oidc-auth-broker
+        install -m 0755 "${_OIDC_TMP}/${_OIDC_DIR}/oidc-pam-helper" /usr/local/bin/oidc-pam-helper
+        install -m 0755 "${_OIDC_TMP}/${_OIDC_DIR}/oidc-admin" /usr/local/bin/oidc-admin
+        mkdir -p /usr/lib64/security
+        install -m 0644 "${_OIDC_TMP}/${_OIDC_DIR}/pam_oidc.so" /usr/lib64/security/pam_oidc.so
+        if [ -x /usr/local/bin/oidc-auth-broker ]; then
+          echo "=== oidc-pam ${OOD_OIDC_PAM_VERSION} installed at boot (checksum ${_OIDC_ACT}) ==="
+        else
+          echo "ERROR: oidc-auth-broker not present after extraction — install failed"
+        fi
       else
         echo "ERROR: oidc-pam checksum mismatch at boot — not installing (supply chain safety)"
       fi
     else
-      echo "ERROR: failed to download oidc-pam ${OOD_OIDC_PAM_VERSION} at boot"
+      echo "ERROR: failed to download oidc-pam ${OOD_OIDC_PAM_VERSION} (${_OIDC_ASSET}) at boot"
     fi
     rm -rf "${_OIDC_TMP}"
   fi
@@ -240,12 +254,18 @@ fi
 ###############################################################################
 # 4. Generate OOD portal config from SSM parameters
 ###############################################################################
-if [ -n "${OOD_DOMAIN}" ]; then
-  echo "=== Generating ood_portal.yml ==="
+# #35: generate the web-auth layer whenever OIDC is configured — not only when a
+# domain is set. With enable_alb=true and no domain, OOD_DOMAIN is empty but the portal
+# is still reachable at the ALB DNS name, which must be the servername so the OIDC
+# redirect_uri matches the Cognito callback (also registered to the ALB DNS).
+# Precedence: domain > ALB DNS > instance public hostname (last resort).
+if [ -n "${OOD_OIDC_CLIENT_ID}" ] && [ -n "${OOD_OIDC_ISSUER_URL}" ]; then
+  SERVERNAME="${OOD_DOMAIN:-${OOD_ALB_DNS:-$(imds_get public-hostname)}}"
+  echo "=== Generating ood_portal.yml (servername=${SERVERNAME}) ==="
 
   cat > /etc/ood/config/ood_portal.yml <<OODPORTAL
 ---
-servername: "${OOD_DOMAIN}"
+servername: "${SERVERNAME}"
 oidc_uri: /oidc
 oidc_discover_uri: /oidc/.well-known/openid-configuration
 oidc_discover_root: /var/www/ood/discover
@@ -256,6 +276,8 @@ oidc_remote_user_claim: "preferred_username"
 oidc_scope: "openid email profile"
 oidc_session_inactivity_timeout: 28800
 oidc_session_max_duration: 28800
+# NOTE: oidc-pam v0.3.x ships no standalone 'oidc-pam' binary; the canonical
+# user-mapping command is pending clarification in scttfrdmn/oidc-pam#87.
 user_map_cmd: "/usr/local/bin/oidc-pam map-user"
 OODPORTAL
 

@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `scripts/userdata.sh` + `scripts/bake.sh`: corrected the oidc-pam download so the
+  `oidc-auth-broker` binary actually installs (#34). The release assets are
+  `oidc-pam-<ver>-linux-<arch>.tar.gz` with a per-asset `.sha256` sidecar (not
+  `oidc-pam_linux_<arch>.tar.gz` / `checksums.txt`), and the tarball extracts to a
+  versioned subdir — so the binaries (`oidc-auth-broker`, `oidc-pam-helper`,
+  `oidc-admin`) and `pam_oidc.so` are now placed explicitly after extraction. Removed
+  dead assumptions (`oidc-pam` binary, `libnss_oidc.so.2`) that v0.3.x does not ship.
+  Default `oidc_pam_version` bumped to v0.3.2.
+- `scripts/userdata.sh` + `terraform/main.tf`: generate the Apache web-auth layer
+  (`ood_portal.yml` + `update_ood_portal`) whenever OIDC is configured, not only when a
+  domain is set (#35). With `enable_alb=true` and no domain the portal was stuck on the
+  `need_auth` page. `servername` now resolves domain → ALB DNS → instance hostname, with
+  the ALB DNS injected via the new `OOD_ALB_DNS` user_data export (aligning with the
+  Cognito callback, which already uses the ALB DNS).
 - `terraform/main.tf`: ALB-logs bucket policy no longer rejected as malformed (#31).
   Removed the `DenyVersioningDisable` statement — it used a non-existent S3 condition
   key (`s3:VersionStatus`), so S3 rejected the entire policy on PutBucketPolicy and

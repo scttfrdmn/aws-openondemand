@@ -103,16 +103,22 @@ else
   OIDC_PAM_ARCH="${ARCH}"
 fi
 
-OIDC_PAM_TGZ_URL="https://github.com/scttfrdmn/oidc-pam/releases/download/${OIDC_PAM_VERSION}/oidc-pam_linux_${OIDC_PAM_ARCH}.tar.gz"
-OIDC_PAM_SHA_URL="https://github.com/scttfrdmn/oidc-pam/releases/download/${OIDC_PAM_VERSION}/checksums.txt"
+# #34: real release asset naming is oidc-pam-<ver>-linux-<arch>.tar.gz with a per-asset
+# <asset>.sha256 sidecar (NOT oidc-pam_linux_<arch>.tar.gz / checksums.txt). The tarball
+# extracts to a versioned subdir, so binaries are placed explicitly after extraction.
+# NOTE: keep this in sync with the runtime fallback in scripts/userdata.sh.
+OIDC_PAM_ASSET="oidc-pam-${OIDC_PAM_VERSION}-linux-${OIDC_PAM_ARCH}.tar.gz"
+OIDC_PAM_DIR="oidc-pam-${OIDC_PAM_VERSION}-linux-${OIDC_PAM_ARCH}"
+OIDC_PAM_TGZ_URL="https://github.com/scttfrdmn/oidc-pam/releases/download/${OIDC_PAM_VERSION}/${OIDC_PAM_ASSET}"
+OIDC_PAM_SHA_URL="${OIDC_PAM_TGZ_URL}.sha256"
 echo "=== Installing oidc-pam ${OIDC_PAM_VERSION} ==="
 if curl -fsSL --head "${OIDC_PAM_TGZ_URL}" 2>/dev/null | grep -q "200\|302"; then
   TMPDIR=$(mktemp -d)
-  TGZ="${TMPDIR}/oidc-pam.tar.gz"
+  TGZ="${TMPDIR}/${OIDC_PAM_ASSET}"
   curl -fsSL "${OIDC_PAM_TGZ_URL}" -o "${TGZ}"
-  # Verify SHA256 checksum when checksums.txt is available
-  if curl -fsSL "${OIDC_PAM_SHA_URL}" -o "${TMPDIR}/checksums.txt" 2>/dev/null; then
-    EXPECTED=$(grep "oidc-pam_linux_${OIDC_PAM_ARCH}.tar.gz" "${TMPDIR}/checksums.txt" | awk '{print $1}')
+  # Verify against the per-asset .sha256 sidecar (format: "<hash>  <filename>")
+  if curl -fsSL "${OIDC_PAM_SHA_URL}" -o "${TMPDIR}/${OIDC_PAM_ASSET}.sha256" 2>/dev/null; then
+    EXPECTED=$(awk '{print $1}' "${TMPDIR}/${OIDC_PAM_ASSET}.sha256")
     ACTUAL=$(sha256sum "${TGZ}" | awk '{print $1}')
     if [ "${EXPECTED}" != "${ACTUAL}" ]; then
       echo "ERROR: oidc-pam checksum mismatch — aborting install"
@@ -121,43 +127,32 @@ if curl -fsSL --head "${OIDC_PAM_TGZ_URL}" 2>/dev/null | grep -q "200\|302"; the
     fi
     echo "oidc-pam checksum verified: ${ACTUAL}"
   else
-    echo "ERROR: checksums.txt unavailable — aborting for supply chain safety"
+    echo "ERROR: ${OIDC_PAM_ASSET}.sha256 unavailable — aborting for supply chain safety"
     rm -rf "${TMPDIR}"
     exit 1
   fi
-  tar -xz -C /usr/local/bin/ -f "${TGZ}"
+  # Extract the versioned subdir, then place the real artifacts the package ships.
+  tar -xz -C "${TMPDIR}" -f "${TGZ}"
+  install -m 0755 "${TMPDIR}/${OIDC_PAM_DIR}/oidc-auth-broker" /usr/local/bin/oidc-auth-broker
+  install -m 0755 "${TMPDIR}/${OIDC_PAM_DIR}/oidc-pam-helper" /usr/local/bin/oidc-pam-helper
+  install -m 0755 "${TMPDIR}/${OIDC_PAM_DIR}/oidc-admin" /usr/local/bin/oidc-admin
+  mkdir -p /usr/lib64/security
+  install -m 0644 "${TMPDIR}/${OIDC_PAM_DIR}/pam_oidc.so" /usr/lib64/security/pam_oidc.so
   rm -rf "${TMPDIR}"
-  chmod 755 /usr/local/bin/oidc-pam /usr/local/bin/oidc-auth-broker 2>/dev/null || true
-  # Verify extraction succeeded and binary is functional (L4)
-  if [ ! -f /usr/local/bin/oidc-pam ] || [ ! -x /usr/local/bin/oidc-pam ]; then
-    echo "ERROR: oidc-pam binary missing or not executable after extraction"
+  # Assert the runtime-critical artifacts landed. (The v0.3.x package ships
+  # oidc-auth-broker + pam_oidc.so; there is no standalone oidc-pam binary or
+  # libnss_oidc.so.2 — see oidc-pam integration issue referenced in userdata.sh.)
+  if [ ! -x /usr/local/bin/oidc-auth-broker ]; then
+    echo "FATAL: oidc-auth-broker missing/not executable after extraction — aborting AMI bake"
     exit 1
   fi
-  if ! /usr/local/bin/oidc-pam --version > /dev/null 2>&1; then
-    echo "ERROR: oidc-pam binary failed smoke test — binary may be corrupted"
-    exit 1
-  fi
-  # L2: verify PAM and NSS modules were extracted — these are the runtime-critical files.
-  # The binary smoke-test above only checks the CLI; pam_oidc.so and nss_oidc.so are what
-  # actually perform authentication at runtime. A baked AMI without these is silently broken.
-  PAM_MODULE_MISSING=0
-  for module_path in \
-    /usr/lib64/security/pam_oidc.so \
-    /usr/lib64/libnss_oidc.so.2; do
-    if [ ! -f "${module_path}" ]; then
-      echo "ERROR: Required module not found: ${module_path}"
-      PAM_MODULE_MISSING=1
-    fi
-  done
-  if [ "${PAM_MODULE_MISSING}" -eq 1 ]; then
-    echo "FATAL: One or more oidc-pam PAM/NSS modules are missing after extraction."
-    echo "       Aborting AMI bake — a portal without these modules will silently reject all logins."
-    echo "       Check that oidc-pam ${OIDC_PAM_VERSION} ships PAM/NSS modules for ${OIDC_PAM_ARCH}."
+  if [ ! -f /usr/lib64/security/pam_oidc.so ]; then
+    echo "FATAL: pam_oidc.so not installed — a portal without it silently rejects logins; aborting AMI bake"
     exit 1
   fi
   echo "=== oidc-pam ${OIDC_PAM_VERSION} installed ==="
 else
-  echo "ERROR: oidc-pam binary not available at ${OIDC_PAM_TGZ_URL} — aborting AMI build (L1)"
+  echo "ERROR: oidc-pam asset not available at ${OIDC_PAM_TGZ_URL} — aborting AMI build (L1)"
   echo "       Set OIDC_PAM_VERSION to a published release tag and retry."
   exit 1
 fi
@@ -166,21 +161,10 @@ fi
 mkdir -p /etc/oidc-auth
 chmod 700 /etc/oidc-auth
 
-# Install PAM module for oidc-pam
-# The oidc-pam release should include pam_oidc.so — place in PAM module dir
-ARCH_PAM=$(uname -m)
-PAM_MODULE_PATH="/usr/lib64/security/pam_oidc.so"
-if [ -f /usr/local/bin/pam_oidc.so ]; then
-  cp /usr/local/bin/pam_oidc.so "${PAM_MODULE_PATH}"
-  chmod 644 "${PAM_MODULE_PATH}"
-fi
-
-# NSS module for oidc-pam UID mapping (libnss_oidc.so)
-NSS_MODULE_PATH="/usr/lib64/libnss_oidc.so.2"
-if [ -f /usr/local/bin/libnss_oidc.so.2 ]; then
-  cp /usr/local/bin/libnss_oidc.so.2 "${NSS_MODULE_PATH}"
-  chmod 644 "${NSS_MODULE_PATH}"
-fi
+# pam_oidc.so is placed by the oidc-pam install step above (install -D into
+# /usr/lib64/security/). The v0.3.x package ships no libnss_oidc.so.2, so there is no
+# NSS module to install — the prior cp-from-/usr/local/bin blocks were dead code that
+# assumed a flat-extract layout and an NSS artifact that don't exist (#34).
 
 ###############################################################################
 # 5. Adapter binary placeholders
