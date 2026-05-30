@@ -1,5 +1,10 @@
 # Open OnDemand AWS Deployment
 
+[![CI](https://github.com/scttfrdmn/aws-openondemand/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/aws-openondemand/actions/workflows/ci.yml)
+[![IaC: Terraform | CDK](https://img.shields.io/badge/IaC-Terraform%20%7C%20CDK-623ce4.svg)](https://github.com/scttfrdmn/aws-openondemand)
+[![Security: checkov + tfsec](https://img.shields.io/badge/security-checkov%20%2B%20tfsec-brightgreen.svg)](https://github.com/scttfrdmn/aws-openondemand/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Deploy [Open OnDemand](https://openondemand.org/) on AWS with pluggable compute
 backends using either Terraform or AWS CDK (Go). Both tools produce identical
 infrastructure.
