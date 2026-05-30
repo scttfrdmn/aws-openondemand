@@ -1617,18 +1617,14 @@ resource "aws_s3_bucket_policy" "alb_logs" {
         Action    = "s3:PutObject"
         Resource  = "${aws_s3_bucket.alb_logs[0].arn}/alb-logs/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
       },
-      {
-        # H4: Prevent any principal (including account root) from disabling versioning.
-        # Versioning must remain enabled to detect log deletion or tampering.
-        Sid       = "DenyVersioningDisable"
-        Effect    = "Deny"
-        Principal = "*"
-        Action    = "s3:PutBucketVersioning"
-        Resource  = aws_s3_bucket.alb_logs[0].arn
-        Condition = {
-          StringEquals = { "s3:VersionStatus" = "Suspended" }
-        }
-      },
+      # H4 (was DenyVersioningDisable): a bucket policy cannot prevent suspending
+      # versioning — there is no `s3:VersionStatus` request condition key, and S3
+      # rejects the entire policy as malformed if one is used (#31). Versioning is
+      # kept on by aws_s3_bucket_versioning.alb_logs; enforcing that it stays on
+      # belongs to an Organizations SCP or a permissions boundary (deny
+      # s3:PutBucketVersioning on this bucket ARN at the org/role level), or to
+      # S3 Object Lock for true write-once immutability — none of which can be
+      # expressed in a bucket policy condition.
       {
         Sid       = "DenyHTTP"
         Effect    = "Deny"
