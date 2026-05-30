@@ -75,6 +75,11 @@ output "s3_browser_bucket" {
   sensitive   = true # M7
 }
 
+output "artifacts_bucket" {
+  description = "Bootstrap artifacts bucket — stage adapter binaries / app bundles here under a prefix (the instance role can only read this bucket; see docs/adapter-guide.md)."
+  value       = aws_s3_bucket.artifacts.id
+}
+
 output "acm_certificate_validation_cname" {
   description = "ACM DNS validation CNAME record — add to your DNS provider"
   value = (

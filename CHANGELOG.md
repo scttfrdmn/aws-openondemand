@@ -13,8 +13,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test-environment single-subnet fallback always failed at `aws_lb` creation with an AWS
   ValidationError (#33). Applies to all environments; message tells the operator to set
   `alb_subnet_ids`.
-
-### Fixed
 - `scripts/userdata.sh` + `terraform/main.tf`: rewrote `broker.yaml` to the oidc-auth-broker
   v0.3.x nested schema (`server`/`oidc.providers`/`authentication`/`security`/`audit`). The
   old flat top-level schema was rejected with "at least one OIDC provider must be configured"
@@ -71,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (rather than emitted with an empty `metrics` array) when `enable_efs = false`.
 
 ### Added
+- `docs/adapter-guide.md` + `terraform/outputs.tf`: documented how to deploy adapter
+  binaries / app bundles — stage them into the existing `ood-artifacts-<env>-*` bucket
+  (the instance role and S3 gateway endpoint only permit `ood-*`/the artifacts bucket, so a
+  separate scratch bucket is unreadable), pull via SSM. Added an `artifacts_bucket` output
+  so the workflow is runnable (#27).
 - Local-account provisioning (#39): a `pam_exec` hook (`ood-provision-user`) +
   `pam_mkhomedir` in `/etc/pam.d/ood` now materialize the local Unix account on first
   login, since oidc-pam v0.3.x is PAM-only and does not create accounts. UIDs are

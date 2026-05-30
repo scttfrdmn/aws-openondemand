@@ -28,6 +28,50 @@ When an adapter is listed in `adapters_enabled`, Terraform creates:
 - The corresponding AWS infrastructure (Batch compute environment, SageMaker domain, etc.)
 - A cluster YAML file in `/etc/ood/config/clusters.d/` at boot
 
+## Deploying adapter binaries & app bundles
+
+Terraform wires up the IAM, infrastructure, and cluster YAML, but the adapter
+**binaries** (`/usr/local/lib/ood-adapters/ood-*-adapter`) and the **app bundles**
+(`/var/www/ood/apps/sys/aws-*`) are artifacts you install onto the running portal
+instance.
+
+**Stage them into the existing artifacts bucket — not a new bucket.** The OOD instance
+role's S3 read is scoped to exactly `ood-artifacts-<env>-*`
+(`aws_iam_role_policy.artifacts_read`), and when `enable_vpc_endpoints=true` the S3
+gateway endpoint policy further restricts the role to `arn:aws:s3:::ood-*`. A separate
+scratch bucket (especially one not `ood-`prefixed) is therefore **unreadable** by the
+instance — there is no IAM grant for it.
+
+From a workstation with deploy credentials, upload under a prefix in the artifacts
+bucket. The bucket policy enforces TLS + SSE, so pass `--sse AES256`:
+
+```bash
+ARTIFACTS=$(terraform -chdir=terraform output -raw artifacts_bucket)   # ood-artifacts-<env>-...
+
+# Adapter binaries
+aws s3 cp ood-aws-batch-adapter "s3://${ARTIFACTS}/adapters/ood-aws-batch-adapter" --sse AES256
+
+# App bundles (tar a bundle dir from ood-apps/apps/)
+aws s3 cp aws-batch.tar.gz "s3://${ARTIFACTS}/ood-apps/aws-batch.tar.gz" --sse AES256
+```
+
+Then pull them onto the instance over SSM Session Manager (no SSH):
+
+```bash
+aws ssm start-session --target "$INSTANCE_ID"
+# on the instance:
+sudo aws s3 cp "s3://${ARTIFACTS}/adapters/ood-aws-batch-adapter" \
+  /usr/local/lib/ood-adapters/ood-aws-batch-adapter
+sudo chmod 0755 /usr/local/lib/ood-adapters/ood-aws-batch-adapter
+
+sudo aws s3 cp "s3://${ARTIFACTS}/ood-apps/aws-batch.tar.gz" /tmp/aws-batch.tar.gz
+sudo tar -xzf /tmp/aws-batch.tar.gz -C /var/www/ood/apps/sys/
+```
+
+> If you genuinely need a dedicated staging bucket, name it with the `ood-` prefix
+> (so the S3 endpoint policy permits it) **and** add an IAM read grant for it to the
+> instance role — otherwise the pull will be denied.
+
 ## AWS Batch Adapter
 
 Prerequisites:
