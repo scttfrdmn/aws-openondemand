@@ -264,11 +264,11 @@ variable "enable_packer_ami" {
 
 variable "oidc_pam_version" {
   type        = string
-  default     = "v0.3.2"
+  default     = "v0.3.3"
   description = "oidc-pam release tag the baked AMI ships. userdata.sh uses it as a runtime fallback to install oidc-pam/oidc-auth-broker at boot if the AMI is missing the binary (#26/#34). Should match the version baked via packer's oidc_pam_version."
   validation {
     condition     = can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+", var.oidc_pam_version))
-    error_message = "oidc_pam_version must be a semantic version tag starting with 'v' (e.g. v0.3.1)."
+    error_message = "oidc_pam_version must be a semantic version tag starting with 'v' (e.g. v0.3.3)."
   }
 }
 

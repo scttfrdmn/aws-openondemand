@@ -27,8 +27,14 @@ When `use_cognito=true` (default), Terraform/CDK creates:
 
 The `userdata.sh` script reads these SSM parameters at boot and configures:
 - `/etc/oidc-auth/broker.yaml` — oidc-auth-broker config
-- `/etc/pam.d/ood` — PAM module config
-- `/etc/nsswitch.conf` — NSS module entry
+- `/etc/pam.d/ood` — PAM module config (`pam_oidc.so`)
+
+> **PAM-only (oidc-pam v0.3.x).** oidc-pam ships no NSS module, so there is no
+> `/etc/nsswitch.conf` `oidc` entry. The broker authenticates an OIDC identity for an
+> *existing* local account and provisions `~/.ssh`; it does not resolve
+> identity→username via NSS or create the Unix account. Web identity mapping is handled
+> by Apache `mod_auth_openidc` via `oidc_remote_user_claim` in `ood_portal.yml`. Local
+> account provisioning is a separate concern — see the account-provisioning issue.
 
 ## InCommon / Shibboleth Federation
 

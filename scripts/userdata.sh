@@ -214,12 +214,11 @@ home_dir_prefix: /home
 BROKERCONF
   chmod 600 /etc/oidc-auth/broker.yaml
 
-  # Configure NSS to use oidc-pam for user lookups
-  if ! grep -q "oidc" /etc/nsswitch.conf; then
-    sed -i 's/^passwd:\(.*\)/passwd:\1 oidc/' /etc/nsswitch.conf
-    sed -i 's/^group:\(.*\)/group:\1 oidc/' /etc/nsswitch.conf
-    sed -i 's/^shadow:\(.*\)/shadow:\1 oidc/' /etc/nsswitch.conf
-  fi
+  # No NSS wiring: oidc-pam v0.3.x is PAM-only and ships no libnss_oidc module
+  # (confirmed in scttfrdmn/oidc-pam#87). The broker authenticates an OIDC identity for
+  # an *already-existing* local account and provisions ~/.ssh; it does not resolve
+  # identity->username via NSS or create the account. Local-account provisioning is
+  # tracked separately — see the aws-openondemand account-provisioning issue.
 
   # Configure PAM for OOD authentication
   cat > /etc/pam.d/ood <<'PAMCONF'
@@ -276,9 +275,9 @@ oidc_remote_user_claim: "preferred_username"
 oidc_scope: "openid email profile"
 oidc_session_inactivity_timeout: 28800
 oidc_session_max_duration: 28800
-# NOTE: oidc-pam v0.3.x ships no standalone 'oidc-pam' binary; the canonical
-# user-mapping command is pending clarification in scttfrdmn/oidc-pam#87.
-user_map_cmd: "/usr/local/bin/oidc-pam map-user"
+# No user_map_cmd: OOD maps the authenticated identity to a local user via
+# oidc_remote_user_claim (above). oidc-pam v0.3.x provides no map command — the
+# /usr/local/bin/oidc-pam map-user path never existed (scttfrdmn/oidc-pam#87).
 OODPORTAL
 
   # Regenerate OOD Apache config from the portal YAML

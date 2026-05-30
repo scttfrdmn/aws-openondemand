@@ -199,7 +199,8 @@ oidc_remote_user_claim: "preferred_username"
 oidc_scope: "openid email profile"
 oidc_session_inactivity_timeout: 28800
 oidc_session_max_duration: 28800
-user_map_cmd: "/usr/local/bin/oidc-pam map-user"
+# No user_map_cmd: identity maps via oidc_remote_user_claim; oidc-pam v0.3.x has
+# no map command (scttfrdmn/oidc-pam#87).
 OODPORTAL
 
 # PHP session hardening (only if PHP is installed — OOD 4.x doesn't use system PHP)
