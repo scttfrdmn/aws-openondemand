@@ -778,10 +778,16 @@ resource "aws_dynamodb_table" "uid_map" {
   count        = var.enable_dynamodb_uid ? 1 : 0
   name         = "oid-uid-map-${var.environment}"
   billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "oidc_sub"
+  # #39: keyed on `username` (the preferred_username claim). The account-provisioning
+  # PAM hook (pam_exec → ood-provision-user) only receives PAM_USER, not the OIDC sub,
+  # so username is the lookup key. Rows are {username, uid}; a "__uid_counter__" sentinel
+  # item holds the next_uid for atomic allocation. (On an existing deployment this key
+  # change forces a replace, which prevent_destroy blocks by design — the table is empty
+  # in practice since this is the first wiring; remove the guard for the one-time rekey.)
+  hash_key = "username"
 
   attribute {
-    name = "oidc_sub"
+    name = "username"
     type = "S"
   }
 
@@ -1212,6 +1218,19 @@ resource "aws_s3_object" "bake" {
   kms_key_id             = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
 }
 
+# #39: account-provisioning helper, fetched by userdata.sh and invoked by the pam_exec
+# hook to materialize local accounts from the DynamoDB UID map on first login.
+resource "aws_s3_object" "provision_user" {
+  count       = var.enable_dynamodb_uid ? 1 : 0
+  bucket      = aws_s3_bucket.artifacts.id
+  key         = "ood-provision-user.sh"
+  source      = "${path.module}/../scripts/ood-provision-user.sh"
+  source_hash = filemd5("${path.module}/../scripts/ood-provision-user.sh")
+
+  server_side_encryption = var.enable_kms_cmk ? "aws:kms" : "AES256"
+  kms_key_id             = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+}
+
 # ---------------------------------------------------------------------------
 # SSM Parameter Store — runtime config for userdata.sh
 # ---------------------------------------------------------------------------
@@ -1466,7 +1485,7 @@ resource "aws_launch_template" "ood" {
 
   # The bootstrap scripts must exist in S3 before any instance boots and runs the
   # user_data stub that fetches them (#16).
-  depends_on = [aws_s3_object.userdata, aws_s3_object.bake]
+  depends_on = [aws_s3_object.userdata, aws_s3_object.bake, aws_s3_object.provision_user]
 }
 
 resource "aws_autoscaling_group" "ood" {

@@ -64,6 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (rather than emitted with an empty `metrics` array) when `enable_efs = false`.
 
 ### Added
+- Local-account provisioning (#39): a `pam_exec` hook (`ood-provision-user`) +
+  `pam_mkhomedir` in `/etc/pam.d/ood` now materialize the local Unix account on first
+  login, since oidc-pam v0.3.x is PAM-only and does not create accounts. UIDs are
+  allocated from the DynamoDB UID map (`oid-uid-map-<env>`, re-keyed on `username`, atomic
+  counter + conditional put) so they are stable across the EFS `/home` and compute nodes.
+  Completes the OIDC login chain. Requires `enable_dynamodb_uid` (default on).
 - braket compute backend fully wired: `adapters_enabled` accepts `braket`, with a scoped
   IAM policy (`braket:*QuantumTask*` + device discovery + results S3) and an `aws-braket.yml`
   OOD cluster generator. Pairs with the `aws-braket` app bundle in ood-apps (#28).

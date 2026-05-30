@@ -33,8 +33,24 @@ The `userdata.sh` script reads these SSM parameters at boot and configures:
 > `/etc/nsswitch.conf` `oidc` entry. The broker authenticates an OIDC identity for an
 > *existing* local account and provisions `~/.ssh`; it does not resolve
 > identity→username via NSS or create the Unix account. Web identity mapping is handled
-> by Apache `mod_auth_openidc` via `oidc_remote_user_claim` in `ood_portal.yml`. Local
-> account provisioning is a separate concern — see the account-provisioning issue.
+> by Apache `mod_auth_openidc` via `oidc_remote_user_claim` in `ood_portal.yml`.
+
+### Local account provisioning
+
+Because oidc-pam does not create accounts, OOD materializes them itself on first login
+(replacing the dropped NSS/LDAP model). The PAM stack runs, in order:
+
+1. `pam_oidc.so` — authenticate the OIDC identity (broker, device flow).
+2. `pam_exec.so /usr/local/bin/ood-provision-user` — allocate a **stable UID** from the
+   DynamoDB UID map (`oid-uid-map-<env>`, keyed on `username`, atomic counter +
+   conditional put) and `useradd` the account if it doesn't exist. Idempotent.
+3. `pam_mkhomedir.so` — create the home directory under `/home` (EFS-backed, so homes and
+   UIDs are consistent across the portal and any compute nodes).
+
+UID allocation uses a `__uid_counter__` sentinel item in the table, so the same username
+gets the same UID on every instance. Requires `enable_dynamodb_uid = true` (the default);
+with it off, the hook no-ops and accounts must be provisioned by other means
+(SSSD/directory sync). See `scripts/ood-provision-user.sh`.
 
 ## InCommon / Shibboleth Federation
 
