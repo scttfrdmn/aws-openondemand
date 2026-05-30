@@ -348,16 +348,30 @@ oidc_session_max_duration: 28800
 # No user_map_cmd: OOD maps the authenticated identity to a local user via
 # oidc_remote_user_claim (above). oidc-pam v0.3.x provides no map command — the
 # /usr/local/bin/oidc-pam map-user path never existed (scttfrdmn/oidc-pam#87).
+#
+# 52: the oidc_ keys above are necessary but NOT sufficient. ood-portal-generator's
+# view.rb only emits the mod_auth_openidc vhost stanza when auth? is true, i.e. when the
+# auth list is non-empty. Without this block the generator silently falls back to the
+# need_auth config (RewriteRule to /public/need_auth.html) and browser login fails even
+# with a correct OIDC config, loaded module, and live broker. (Keep shell-substitution
+# metacharacters out of this heredoc body — it is unquoted for variable expansion, so
+# they would be evaluated at boot.)
+auth:
+  - 'AuthType openid-connect'
+  - 'Require valid-user'
 OODPORTAL
 
   # Regenerate OOD Apache config from the portal YAML
   if command -v /opt/ood/ood-portal-generator/sbin/update_ood_portal &>/dev/null; then
     /opt/ood/ood-portal-generator/sbin/update_ood_portal
-    # #38: the generator silently degrades to the need_auth fallback if
-    # mod_auth_openidc isn't loadable. Warn loudly so a missing module on an older AMI
-    # is visible instead of a portal stuck on "you need to setup authentication".
-    if ! grep -qi "oidc" /etc/httpd/conf.d/ood-portal.conf 2>/dev/null; then
-      echo "ERROR: ood-portal.conf has no OIDC directives — mod_auth_openidc likely not installed (#38). Web login will fail."
+    # #38/#52: the generator silently degrades to the need_auth fallback (RewriteRule ->
+    # /public/need_auth.html) if mod_auth_openidc isn't loadable OR the auth: block is
+    # missing. Assert the rendered vhost actually carries the OIDC directive
+    # ('openid-connect') rather than a loose "oidc" substring match — need_auth.html does
+    # not contain it, so this catches both failure modes. Warn loudly so the cause is
+    # visible instead of a portal stuck on "you need to setup authentication".
+    if ! grep -qi "openid-connect" /etc/httpd/conf.d/ood-portal.conf 2>/dev/null; then
+      echo "ERROR: ood-portal.conf has no 'openid-connect' AuthType — generator fell back to need_auth (#38/#52). Check mod_auth_openidc is installed and ood_portal.yml has an auth: block. Web login will fail."
     fi
   fi
 fi
