@@ -252,15 +252,37 @@ BROKERCONF
   # No NSS wiring: oidc-pam v0.3.x is PAM-only and ships no libnss_oidc module
   # (confirmed in scttfrdmn/oidc-pam#87). The broker authenticates an OIDC identity for
   # an *already-existing* local account and provisions ~/.ssh; it does not resolve
-  # identity->username via NSS or create the account. Local-account provisioning is
-  # tracked separately — see the aws-openondemand account-provisioning issue.
+  # identity->username via NSS or create the account. OOD materializes the local account
+  # itself via the pam_exec provisioning hook below (#39).
 
-  # Configure PAM for OOD authentication
-  cat > /etc/pam.d/ood <<'PAMCONF'
+  # Install the account-provisioning helper from the artifact bucket (#39). It allocates a
+  # stable UID from the DynamoDB UID map and runs useradd on first login. Only meaningful
+  # when the UID map is enabled; the helper no-ops if OOD_DYNAMODB_UID_TABLE is empty.
+  if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
+    aws s3 cp "s3://${ARTIFACT_BUCKET}/ood-provision-user.sh" /usr/local/bin/ood-provision-user \
+      --region "${AWS_REGION}" && chmod 0755 /usr/local/bin/ood-provision-user
+  fi
+
+  # Configure PAM for OOD authentication. Order matters: pam_oidc authenticates, then the
+  # provisioning hook creates the local account (#39), then pam_mkhomedir creates its home
+  # (on the EFS-mounted /home). pam_exec passes PAM_USER and inherits OOD_DYNAMODB_UID_TABLE
+  # / AWS_REGION exported here so the helper can reach the UID map.
+  cat > /etc/pam.d/ood <<PAMCONF
 auth     required pam_oidc.so
 account  required pam_oidc.so
 session  optional pam_oidc.so
+session  optional pam_exec.so /usr/local/bin/ood-provision-user
+session  optional pam_mkhomedir.so skel=/etc/skel umask=0077
 PAMCONF
+
+  # Make the UID-map table + region available to the pam_exec helper environment.
+  if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
+    cat > /etc/oidc-auth/provision.env <<ENVCONF
+OOD_DYNAMODB_UID_TABLE=${OOD_DYNAMODB_UID_TABLE}
+AWS_REGION=${AWS_REGION}
+ENVCONF
+    chmod 0644 /etc/oidc-auth/provision.env
+  fi
 
   # Enable and start the oidc-auth-broker service
   cat > /etc/systemd/system/oidc-auth-broker.service <<'SVCCONF'
