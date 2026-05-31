@@ -785,7 +785,7 @@ resource "aws_dynamodb_table" "uid_map" {
   count        = var.enable_dynamodb_uid ? 1 : 0
   name         = "oid-uid-map-${var.environment}"
   billing_mode = "PAY_PER_REQUEST"
-  # #39: keyed on `username` (the preferred_username claim). The account-provisioning
+  # #39: keyed on `username` (the cognito:username claim — see #64). The account-provisioning
   # PAM hook (pam_exec → ood-provision-user) only receives PAM_USER, not the OIDC sub,
   # so username is the lookup key. Rows are {username, uid}; a "__uid_counter__" sentinel
   # item holds the next_uid for atomic allocation. (On an existing deployment this key

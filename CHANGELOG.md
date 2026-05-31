@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- OIDC callback no longer 400s on a missing identity claim (#64). The portal keyed on the
+  `preferred_username` claim, but the Cognito pool signs users in by email
+  (`username_attributes = ["email"]`) and never emits `preferred_username`, so
+  mod_auth_openidc could not set the remote user → HTTP 400 after a successful auth. Switched
+  the identity claim to **`cognito:username`** (always present in the Cognito ID token),
+  consistently across `scripts/userdata.sh` (`oidc_remote_user_claim` + the broker
+  `username_claim`) and `scripts/bake.sh`, keeping it in sync with the #39 `ood-provision-user`
+  hook that derives the local account name from it.
+- Quieted mod_auth_openidc forwarded-header warnings (#64, secondary): the #60 fix listed
+  `X-Forwarded-Host`, which the ALB does not send. `OIDCXForwardedHeaders` now lists exactly
+  what the ALB sends — `X-Forwarded-Proto X-Forwarded-Port` (the Proto header is what fixes
+  the http→https redirect_uri).
+
 ### Added
 - Two meta-adapters wired into `adapters_enabled` (TF + CDK): `router` (#6) dispatches by
   job-spec content to the best AWS backend, and `burst` (#5) submits locally until the local
