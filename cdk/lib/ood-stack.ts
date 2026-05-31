@@ -365,7 +365,10 @@ export class OodStack extends cdk.Stack {
       // #25: domain wins; else the ALB DNS (the precondition above guarantees one exists
       // when use_cognito). No localhost fallback — it was never a reachable callback.
       const callbackHost = domainName !== "" ? domainName : alb!.loadBalancerDnsName;
-      const callbackUrl = `https://${callbackHost}/oidc/callback`;
+      // #60: path is `/oidc`, NOT `/oidc/callback`. OOD's ood_portal.yml sets
+      // `oidc_uri: /oidc`, so mod_auth_openidc's OIDCRedirectURI (the redirect_uri sent to
+      // Cognito) is `/oidc`. The registered callback must match that exact path.
+      const callbackUrl = `https://${callbackHost}/oidc`;
 
       appClient = new cognito.UserPoolClient(this, "AppClient", {
         userPool,
@@ -1171,6 +1174,11 @@ export class OodStack extends cdk.Stack {
             path: "/pun/sys/dashboard",
             healthyThresholdCount: 2,
             unhealthyThresholdCount: 3,
+            // #59: OIDC protects the dashboard, so an unauthenticated prober gets a
+            // 302 (Cognito login) or 301 (OOD `/` rewrite), never a 200. Accept the
+            // redirect codes — a 301/302 still proves Apache + the OIDC vhost are alive;
+            // a dead instance returns 5xx. Mirrors the Terraform matcher "200,301,302".
+            healthyHttpCodes: "200,301,302",
           },
         }
       );
