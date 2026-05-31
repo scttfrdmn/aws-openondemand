@@ -68,6 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the http→https redirect_uri).
 
 ### Added
+- Step Functions orchestrator content (#8): a curated library of reference state-machine
+  definitions in `examples/state-machines/` (`genomics-pipeline.asl.json`:
+  Fargate→HealthOmics→Batch→Lambda; `ml-eval-pipeline.asl.json`: Bedrock→EMR Serverless),
+  each Task targeting the same backends the OOD adapters use. Plus an `adapter-guide.md`
+  section on building/deploying custom state machines (named `ood-*` to satisfy the portal's
+  Step Functions IAM) and a pre-filled `aws-stepfunctions-genomics` app bundle in ood-apps.
+  No new binary — the `ood-stepfunctions-adapter` already does StartExecution/DescribeExecution;
+  this turns OOD into a workflow portal via the state-machine library + recipe.
 - Two meta-adapters wired into `adapters_enabled` (TF + CDK): `router` (#6) dispatches by
   job-spec content to the best AWS backend, and `burst` (#5) submits locally until the local
   scheduler queue is busy then overflows to AWS. Both are dispatchers that shell out to the

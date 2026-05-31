@@ -227,3 +227,49 @@ your bucket:
 ```
 
 (`s3:DeleteObject` is only needed when `--cleanup` is enabled, which is the default.)
+
+## Orchestrating multi-stage pipelines with Step Functions
+
+A single adapter maps one OOD job to one AWS backend. Some research workflows are
+*multi-stage* — preprocess on Fargate, align on HealthOmics, variant-call on Batch, annotate
+on Lambda — with retries and branching between stages. Rather than chaining adapters with
+fragile client-side glue, model the whole pipeline as an **AWS Step Functions state machine**
+and submit it through the [`ood-stepfunctions-adapter`](https://github.com/scttfrdmn/ood-stepfunctions-adapter):
+OOD starts one execution and polls `DescribeExecution`, so the user sees a single job while
+the state machine owns the multi-stage lifecycle.
+
+The adapter already works (`submit` → `StartExecution`, `status` → `DescribeExecution`,
+`delete` → `StopExecution`). What this adds is a **library of reference state machines** plus
+the deployment recipe — see [`examples/state-machines/`](../examples/state-machines/):
+
+| Pipeline | Stages (backend) |
+| --- | --- |
+| `genomics-pipeline.asl.json` | preprocess (Fargate) → align (HealthOmics) → variant-call (Batch GPU) → annotate (Lambda) |
+| `ml-eval-pipeline.asl.json` | batch inference (Bedrock) → poll → score (EMR Serverless) |
+
+Each stage targets the same AWS service an existing OOD adapter uses, so the backends are
+ones an adapter-enabled deployment already has.
+
+### Building & deploying a custom state machine
+
+1. **Name it `ood-*`.** The portal's Step Functions IAM (the `stepfunctions_adapter` policy
+   in `terraform/main.tf` and the matching block in `cdk/lib/ood-stack.ts`) scopes
+   `states:StartExecution` to `stateMachine:ood-*` and `DescribeExecution` to
+   `execution:ood-*:*`. A state machine outside that prefix is rejected by the portal role.
+
+2. **Target the adapter backends in your Task states.** Step Functions' AWS SDK service
+   integrations (`arn:aws:states:::aws-sdk:omics:startRun`, `:::bedrock:createModelInvocationJob`,
+   `:::emrserverless:startJobRun`) and the optimized integrations (`:::batch:submitJob.sync`,
+   `:::ecs:runTask.sync`, `:::lambda:invoke`) let one definition span every backend the
+   adapters cover. The state machine's **execution role** (not the OOD instance role) needs
+   permission for whatever it invokes, plus `iam:PassRole` where the service requires it.
+
+3. **Create it** (`aws stepfunctions create-state-machine --name ood-... --definition file://...`),
+   then submit through the `AWS Step Functions` app bundle (paste the ARN + input JSON) or a
+   pre-filled per-pipeline bundle.
+
+4. **Pass parameters via the execution input.** Definitions read `$.field` from the input
+   JSON the form supplies (input/output S3 URIs, workflow IDs, role ARNs).
+
+See [`examples/state-machines/README.md`](../examples/state-machines/README.md) for the full
+deploy walkthrough and the per-pipeline input keys.

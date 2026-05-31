@@ -1,0 +1,87 @@
+{
+  "Comment": "ood-genomics-pipeline — a multi-stage genomics workflow orchestrated for Open OnDemand. OOD submits one execution (via ood-stepfunctions-adapter) and polls DescribeExecution; the state machine fans the work across AWS-native services and reports a single status back. Deploy the state machine with a name that starts with `ood-` so the portal's stepfunctions IAM (states:StartExecution on stateMachine:ood-*) permits it. The Resource ARNs below are placeholders — replace the account/region and the Batch job-queue / HealthOmics workflow / Fargate task-definition / Lambda ARNs with your own at deploy time.",
+  "StartAt": "Preprocess",
+  "States": {
+    "Preprocess": {
+      "Type": "Task",
+      "Comment": "Stage 1 — QC/trim raw reads on Fargate (ECS RunTask).",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "ood-REPLACE_ENV",
+        "TaskDefinition": "arn:aws:ecs:REGION:ACCOUNT:task-definition/ood-preprocess:1",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets.$": "$.subnets",
+            "AssignPublicIp": "DISABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "preprocess",
+              "Environment": [
+                { "Name": "INPUT_S3", "Value.$": "$.input_s3" },
+                { "Name": "OUTPUT_S3", "Value.$": "$.work_s3" }
+              ]
+            }
+          ]
+        }
+      },
+      "ResultPath": "$.preprocess",
+      "Next": "AlignReads"
+    },
+    "AlignReads": {
+      "Type": "Task",
+      "Comment": "Stage 2 — align reads with AWS HealthOmics (same backend as ood-omics-adapter).",
+      "Resource": "arn:aws:states:::aws-sdk:omics:startRun",
+      "Parameters": {
+        "WorkflowId.$": "$.align_workflow_id",
+        "RoleArn.$": "$.omics_role_arn",
+        "OutputUri.$": "$.work_s3",
+        "Name": "ood-align"
+      },
+      "ResultPath": "$.align",
+      "Next": "VariantCall"
+    },
+    "VariantCall": {
+      "Type": "Task",
+      "Comment": "Stage 3 — variant calling on AWS Batch (GPU queue; same backend as ood-aws-batch-adapter).",
+      "Resource": "arn:aws:states:::batch:submitJob.sync",
+      "Parameters": {
+        "JobName": "ood-variant-call",
+        "JobQueue": "ood-REPLACE_ENV",
+        "JobDefinition.$": "$.variant_job_definition",
+        "ContainerOverrides": {
+          "Environment": [
+            { "Name": "ALIGN_S3", "Value.$": "$.work_s3" }
+          ]
+        }
+      },
+      "ResultPath": "$.variant",
+      "Next": "Annotate"
+    },
+    "Annotate": {
+      "Type": "Task",
+      "Comment": "Stage 4 — annotate variants with a Lambda function.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:REGION:ACCOUNT:function:ood-annotate",
+        "Payload": {
+          "variants_s3.$": "$.work_s3",
+          "output_s3.$": "$.output_s3"
+        }
+      },
+      "ResultPath": "$.annotate",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}
