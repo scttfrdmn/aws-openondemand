@@ -283,18 +283,31 @@ PAMCONF
 
   # #67: provision the local account on the WEB-login path. OOD web auth goes
   # mod_auth_openidc -> mod_ood_proxy -> nginx_stage and never opens a PAM session, so the
-  # pam_exec entry above can't fire. nginx_stage's pun_pre_hook_root_cmd runs as root before
-  # the PUN starts and is invoked with `--user <mapped-user>` — the correct hook for
+  # pam_exec entry above can't fire. nginx_stage's pre_hook_root_cmd runs as root before the
+  # PUN starts and is invoked with ONLY `--user <mapped-user>` — the correct hook for
   # materializing the account. ood-provision-user accepts --user as well as $PAM_USER.
+  #
+  # #69: the nginx_stage key is `pre_hook_root_cmd` (NOT `pun_pre_hook_root_cmd` — that
+  # prefixed name is rejected as an invalid option and silently ignored, so the hook never
+  # runs). There is no exports option in nginx_stage 4.0.x (the hook receives only --user),
+  # so the helper reads OOD_DYNAMODB_UID_TABLE / AWS_REGION from /etc/oidc-auth/provision.env
+  # (written below) rather than from the hook environment.
   if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
     mkdir -p /etc/ood/config
     cat >> /etc/ood/config/nginx_stage.yml <<NGINX_STAGE_HOOK
-# #67: create the local Unix account (UID from DynamoDB) before the PUN starts.
-pun_pre_hook_root_cmd: '/usr/local/bin/ood-provision-user'
-pun_pre_hook_exports:
-  - OOD_DYNAMODB_UID_TABLE
-  - AWS_REGION
+# #67/#69: create the local Unix account (UID from DynamoDB) before the PUN starts.
+pre_hook_root_cmd: '/usr/local/bin/ood-provision-user'
 NGINX_STAGE_HOOK
+
+    # #69: assert nginx_stage actually accepts the key — a wrong option name is only a
+    # warning (silently ignored), which is exactly how the pun_-prefixed key slipped
+    # through. Fail loudly so a bad key is caught at boot instead of at first login.
+    if [ -x /opt/ood/nginx_stage/sbin/nginx_stage ]; then
+      if /opt/ood/nginx_stage/sbin/nginx_stage pun --user=__provision_probe__ 2>&1 \
+           | grep -q 'invalid configuration option'; then
+        echo "ERROR: nginx_stage rejected a config option in nginx_stage.yml (#69) — the pre_hook_root_cmd key is wrong and account provisioning will NOT run on web login."
+      fi
+    fi
   fi
 
   # Make the UID-map table + region available to the pam_exec helper environment.
