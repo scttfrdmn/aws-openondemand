@@ -1,0 +1,70 @@
+{
+  "Comment": "ood-ml-eval-pipeline — a two-stage ML model-evaluation workflow for Open OnDemand. Stage 1 runs large-scale batch inference on Amazon Bedrock (same backend as ood-bedrock-adapter); stage 2 scores the outputs on EMR Serverless (same backend as ood-emr-adapter). OOD submits one execution and sees a single status. Deploy with a name starting `ood-` so the portal's stepfunctions IAM permits StartExecution. Replace the placeholder ARNs/IDs at deploy time.",
+  "StartAt": "BatchInference",
+  "States": {
+    "BatchInference": {
+      "Type": "Task",
+      "Comment": "Stage 1 — Bedrock batch model-invocation job over an S3 JSONL manifest.",
+      "Resource": "arn:aws:states:::aws-sdk:bedrock:createModelInvocationJob",
+      "Parameters": {
+        "JobName": "ood-eval-inference",
+        "ModelId.$": "$.model_id",
+        "RoleArn.$": "$.bedrock_role_arn",
+        "InputDataConfig": {
+          "S3InputDataConfig": { "S3Uri.$": "$.input_manifest_s3" }
+        },
+        "OutputDataConfig": {
+          "S3OutputDataConfig": { "S3Uri.$": "$.inference_output_s3" }
+        }
+      },
+      "ResultPath": "$.inference",
+      "Next": "WaitForInference"
+    },
+    "WaitForInference": {
+      "Type": "Wait",
+      "Comment": "Bedrock batch jobs are asynchronous; poll on an interval.",
+      "Seconds": 60,
+      "Next": "CheckInference"
+    },
+    "CheckInference": {
+      "Type": "Task",
+      "Comment": "Poll the batch job until it leaves the in-progress states.",
+      "Resource": "arn:aws:states:::aws-sdk:bedrock:getModelInvocationJob",
+      "Parameters": { "JobIdentifier.$": "$.inference.JobArn" },
+      "ResultPath": "$.inference_status",
+      "Next": "InferenceDone?"
+    },
+    "InferenceDone?": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.inference_status.Status", "StringEquals": "Completed", "Next": "ScoreResults" },
+        { "Variable": "$.inference_status.Status", "StringEquals": "Failed", "Next": "InferenceFailed" },
+        { "Variable": "$.inference_status.Status", "StringEquals": "Stopped", "Next": "InferenceFailed" }
+      ],
+      "Default": "WaitForInference"
+    },
+    "ScoreResults": {
+      "Type": "Task",
+      "Comment": "Stage 2 — score the inference outputs on EMR Serverless (Spark).",
+      "Resource": "arn:aws:states:::aws-sdk:emrserverless:startJobRun",
+      "Parameters": {
+        "ApplicationId.$": "$.emr_application_id",
+        "ExecutionRoleArn.$": "$.emr_role_arn",
+        "Name": "ood-eval-score",
+        "JobDriver": {
+          "SparkSubmit": {
+            "EntryPoint.$": "$.score_script_s3",
+            "SparkSubmitParameters.$": "$.spark_submit_parameters"
+          }
+        }
+      },
+      "ResultPath": "$.score",
+      "End": true
+    },
+    "InferenceFailed": {
+      "Type": "Fail",
+      "Error": "BedrockInferenceFailed",
+      "Cause": "The Bedrock batch model-invocation job did not complete successfully."
+    }
+  }
+}
