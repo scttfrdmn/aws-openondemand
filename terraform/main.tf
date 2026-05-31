@@ -73,6 +73,7 @@ locals {
   enable_fargate            = contains(var.adapters_enabled, "fargate")
   enable_stepfunctions      = contains(var.adapters_enabled, "stepfunctions")
   enable_braket             = contains(var.adapters_enabled, "braket")
+  enable_bedrock            = contains(var.adapters_enabled, "bedrock")
 
   # Precondition: spot profile requires cloud-native stack
   # (enforced below via lifecycle precondition on the ASG)
@@ -2883,6 +2884,40 @@ resource "aws_iam_role_policy" "omics_adapter" {
         Resource = "*"
         Condition = {
           StringEquals = { "iam:PassedToService" = "omics.amazonaws.com" }
+        }
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Bedrock batch-inference adapter (conditional on adapters_enabled containing "bedrock")
+# ---------------------------------------------------------------------------
+resource "aws_iam_role_policy" "bedrock_adapter" {
+  count       = local.enable_bedrock ? 1 : 0
+  name_prefix = "ood-bedrock-adapter-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:CreateModelInvocationJob",
+          "bedrock:GetModelInvocationJob",
+          "bedrock:StopModelInvocationJob",
+          "bedrock:ListModelInvocationJobs",
+        ]
+        Resource = "*"
+      },
+      {
+        # Bedrock assumes this role to read the S3 input manifest and write outputs.
+        # S3 access lives on the passed role's own policy, not the instance role.
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "bedrock.amazonaws.com" }
         }
       },
     ]
