@@ -345,6 +345,15 @@ oidc_remote_user_claim: "preferred_username"
 oidc_scope: "openid email profile"
 oidc_session_inactivity_timeout: 28800
 oidc_session_max_duration: 28800
+# #60: behind the ALB, TLS is terminated at the ALB and forwarded to Apache as plain
+# HTTP on :80. Without this, mod_auth_openidc derives the OIDC redirect_uri scheme from
+# the (HTTP) request and builds an http:// redirect_uri, which Cognito rejects (OIDC
+# requires https except for localhost) and which mismatches the registered https callback.
+# OIDCXForwardedHeaders makes mod_auth_openidc honor the ALB's X-Forwarded-Proto/Host so it
+# builds an https:// redirect_uri. ood-portal-generator passes oidc_settings through into
+# the mod_auth_openidc <Macro> block verbatim.
+oidc_settings:
+  OIDCXForwardedHeaders: "X-Forwarded-Proto X-Forwarded-Host"
 # No user_map_cmd: OOD maps the authenticated identity to a local user via
 # oidc_remote_user_claim (above). oidc-pam v0.3.x provides no map command — the
 # /usr/local/bin/oidc-pam map-user path never existed (scttfrdmn/oidc-pam#87).

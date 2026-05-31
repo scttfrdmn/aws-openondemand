@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- ALB target group is no longer permanently unhealthy once OIDC is wired (#59). The health
+  check on `/pun/sys/dashboard` now accepts `200,301,302` (TF `matcher` / CDK
+  `healthyHttpCodes`) — an authenticated dashboard returns a 301/302 auth redirect to an
+  unauthenticated prober, which still proves Apache + the OIDC vhost are alive. Previously
+  the `200`-only matcher marked the target unhealthy and the ALB returned 502/503.
+- OIDC login behind the ALB no longer fails on a scheme/path mismatch (#60). Two fixes,
+  both in TF + CDK: (1) `scripts/userdata.sh` adds `oidc_settings.OIDCXForwardedHeaders` so
+  mod_auth_openidc honors the ALB's `X-Forwarded-Proto` and builds an **https** redirect_uri
+  (TLS is terminated at the ALB; Apache sees plain HTTP and otherwise emitted `http://`,
+  which Cognito rejects); (2) the Cognito callback URL is reconciled to `/oidc` (OOD's
+  actual `oidc_uri` / `OIDCRedirectURI`), not `/oidc/callback`, so the registered callback
+  matches the redirect_uri Cognito receives.
+
 ### Added
 - Bedrock batch-inference backend wired as a compute adapter (#11): `adapters_enabled`
   accepts `bedrock`, with a scoped IAM policy (`bedrock:*ModelInvocationJob*` +

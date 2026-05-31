@@ -721,10 +721,15 @@ resource "aws_cognito_user_pool_client" "ood" {
   # A stable HTTPS callback is required for the OIDC code flow. The precondition
   # below guarantees either a domain or an ALB exists, so these branches always
   # resolve to a real, reachable host (no localhost fallback — see #25).
+  #
+  # #60: the path is `/oidc`, NOT `/oidc/callback`. OOD's ood_portal.yml sets
+  # `oidc_uri: /oidc`, so mod_auth_openidc's OIDCRedirectURI — the redirect_uri it sends to
+  # Cognito — is `/oidc`. The registered callback must match that exact path or Cognito
+  # rejects the round-trip after the user authenticates.
   callback_urls = var.domain_name != "" ? [
-    "https://${var.domain_name}/oidc/callback"
+    "https://${var.domain_name}/oidc"
     ] : [
-    "https://${aws_lb.ood[0].dns_name}/oidc/callback"
+    "https://${aws_lb.ood[0].dns_name}/oidc"
   ]
 
   logout_urls = var.domain_name != "" ? [
@@ -1738,6 +1743,13 @@ resource "aws_lb_target_group" "ood" {
     unhealthy_threshold = 3
     interval            = 30
     timeout             = 10
+    # #59: once OIDC protects the dashboard, an unauthenticated health-check prober is
+    # redirected to the Cognito login (302), and OOD's `/` rewrite returns 301 — neither is
+    # a 200. Accept the redirect codes: a 301/302 from this path still proves Apache + the
+    # mod_auth_openidc vhost are alive (a dead instance returns 5xx/connection-refused),
+    # which is the liveness signal we actually want. Without this the target is permanently
+    # unhealthy and the ALB returns 502/503 (portal unreachable behind the ALB).
+    matcher = "200,301,302"
   }
 }
 
