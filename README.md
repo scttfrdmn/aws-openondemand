@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Deploy [Open OnDemand](https://openondemand.org/) on AWS with pluggable compute
-backends using either Terraform or AWS CDK (Go). Both tools produce identical
+backends using either Terraform or AWS CDK (TypeScript). Both tools produce identical
 infrastructure.
 
 Cloud-native identity via [oidc-pam](https://github.com/scttfrdmn/oidc-pam)
