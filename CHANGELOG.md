@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `docs/adapter-guide.md` + `README.md`: documented
+  [`ood-staging-wrapper`](https://github.com/scttfrdmn/ood-staging-wrapper) — a transparent
+  S3 data-staging layer that wraps an inner adapter so S3-native backends (SageMaker
+  Training, EMR Serverless, HealthOmics) accept local filesystem paths. Covers the
+  `clusters.d` wiring, flags, and the bring-your-own-bucket instance-role IAM. Optional,
+  decoupled composition pattern — no IaC bucket is provisioned (#7).
+
 ## [0.1.0] - 2026-05-30
 
 First tagged pre-production release. This is a feasibility / pre-1.0 project: the public

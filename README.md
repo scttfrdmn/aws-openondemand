@@ -488,6 +488,7 @@ bash scripts/teardown-terraform-backend.sh
 | [ood-ec2-adapter](https://github.com/scttfrdmn/ood-ec2-adapter) | OOD single-node compute via EC2 Launch Templates (standalone Go binary) |
 | [ood-pcluster-ref](https://github.com/scttfrdmn/ood-pcluster-ref) | Reference ParallelCluster configs + setup scripts for OOD |
 | [aws-role-exec](https://github.com/scttfrdmn/aws-role-exec) | Assume an IAM role and exec a child process with short-lived STS credentials — optional per-job credential scoping (see the adapter guide) |
+| [ood-staging-wrapper](https://github.com/scttfrdmn/ood-staging-wrapper) | Transparent S3 data staging around an inner adapter — local paths in/out for S3-native backends (see the adapter guide) |
 | [aws-hubzero](https://github.com/scttfrdmn/aws-hubzero) | Sister project: HubZero on AWS with the same deployment pattern |
 
 ---
