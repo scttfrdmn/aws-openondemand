@@ -173,3 +173,57 @@ aws-role-exec --role-arn arn:... --format credentials-file --output-file /tmp/jo
 Flags: `--role-arn` (required), `--duration` (default 1h, max 12h), `--session-name`,
 `--region`, `--format` (`env` | `json` | `credentials-file`), `--output-file`. See the
 [aws-role-exec README](https://github.com/scttfrdmn/aws-role-exec) for the full reference.
+
+## Staging local data to/from S3 with ood-staging-wrapper
+
+The S3-native backends (SageMaker Training, EMR Serverless, HealthOmics) expect job inputs
+and outputs in S3. Researchers working on a shared cluster filesystem (EFS, Lustre, NFS)
+think in local paths. [`ood-staging-wrapper`](https://github.com/scttfrdmn/ood-staging-wrapper)
+bridges that gap: it uploads local input paths to S3 before submission, rewrites the job
+spec to the S3 URIs, runs the inner adapter, and on completion syncs the results back to a
+local directory.
+
+Like aws-role-exec, this is **optional and decoupled** — neither repo depends on the other;
+you compose them by prefixing an adapter's `clusters.d` `submit`/`status` with the wrapper
+and passing the real adapter after `--`.
+
+```yaml
+# /etc/ood/config/clusters.d/aws-sagemaker-training.yml (excerpt)
+v2:
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/bin/ood-staging-wrapper"
+      args:
+        - "submit"
+        - "--staging-bucket=my-ood-staging"
+        - "--"
+        - "/usr/local/lib/ood-adapters/ood-sagemaker-training-adapter"
+        - "submit"
+        - "--region=us-west-2"
+```
+
+On `submit` the wrapper uploads local input fields (`input`, `input_path`, `input_dir`,
+`data`, `data_path`) to `s3://<bucket>/<prefix>/<job>/input/` and rewrites them; output
+fields (`output`, `output_path`, `results`, …) are rewritten to the staged S3 output URI and
+synced back to the local path on a `completed` `status`. Fields already holding an `s3://`
+value are left untouched.
+
+Flags: `--staging-bucket` (required), `--staging-prefix` (default `ood-staging`),
+`--sync-tool` (`s5cmd` default, or `aws`), `--cleanup` (default true). See the
+[ood-staging-wrapper README](https://github.com/scttfrdmn/ood-staging-wrapper) for details.
+
+**Required IAM.** The OOD instance role must be able to read/write the staging bucket. This
+is bring-your-own-bucket — aws-openondemand does not provision it — so add a policy scoped to
+your bucket:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket", "s3:DeleteObject"],
+  "Resource": ["arn:aws:s3:::my-ood-staging", "arn:aws:s3:::my-ood-staging/*"]
+}
+```
+
+(`s3:DeleteObject` is only needed when `--cleanup` is enabled, which is the default.)
