@@ -222,7 +222,11 @@ oidc:
       client_secret: "${OOD_OIDC_CLIENT_SECRET}"
       scopes: ["openid", "email", "profile"]
       user_mapping:
-        username_claim: "cognito:username" # #64: always present; preferred_username is not (pool signs in by email)
+        # #75: key on email (cognito:username is the sub UUID under email-login). The broker
+        # is the SSH/PAM path and can't regex-extract, so it sees the full email — a known
+        # minor divergence from the web path's local-part (web uses an OIDCRemoteUserClaim
+        # regex). SSH-via-oidc-pam is not the primary tested path; revisit if it becomes one.
+        username_claim: "email"
         email_claim: "email"
         name_claim: "name"
       priority: 1
@@ -347,12 +351,21 @@ oidc_discover_root: /var/www/ood/discover
 oidc_provider_metadata_url: "${OOD_OIDC_ISSUER_URL}/.well-known/openid-configuration"
 oidc_client_id: "${OOD_OIDC_CLIENT_ID}"
 oidc_client_secret: "${OOD_OIDC_CLIENT_SECRET}"
-# #64: key on cognito:username, which Cognito ALWAYS emits in the ID token. The pool uses
-# username_attributes = ["email"] and does not populate preferred_username, so keying on
-# preferred_username made the callback fail with HTTP 400 (claim absent from the token).
-# Must stay in sync with the broker username_claim (above) and the ood-provision-user hook,
-# which turns this claim into the local Unix account name.
-oidc_remote_user_claim: "cognito:username"
+# Identity claim to local Unix username. History:
+#  - #64 moved off preferred_username (absent under this pool, caused HTTP 400) to cognito:username.
+#  - #75: but with username_attributes set to email, cognito:username is the Cognito sub UUID,
+#    which useradd rejects (invalid name), so no account is created and the PUN 404s. Key on
+#    the email claim and use mod_auth_openidc's two-argument OIDCRemoteUserClaim regex form to
+#    extract the email local-part as REMOTE_USER (demo@example.com becomes demo).
+#    ood-portal-generator emits the OIDCRemoteUserClaim value verbatim, so the
+#    claim-then-regex form passes through. The local-part is a valid Unix name (no --badname)
+#    and matches nginx_stage's user_regex. Single-domain assumption: demo@a.edu and
+#    demo@b.edu would collide (acceptable here).
+#  NOTE: keep shell metacharacters (backticks, angle brackets, dollar-paren) out of this
+#  comment — the heredoc is unquoted for variable expansion and would evaluate them at boot.
+# The provisioning hook receives this same REMOTE_USER via --user, so #39/#67/#71 stay
+# consistent automatically. ^([^@]+)@ captures everything before the first @.
+oidc_remote_user_claim: "email ^([^@]+)@"
 oidc_scope: "openid email profile"
 oidc_session_inactivity_timeout: 28800
 oidc_session_max_duration: 28800

@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- PUN 404 after a successful login (#75). With `username_attributes = ["email"]`, the
+  `cognito:username` claim chosen in #64 is the Cognito `sub` UUID, which `useradd` rejects as
+  an invalid name → no local account → `/pun/sys/dashboard` 404s. Switched the web identity
+  to the **email local-part**: `oidc_remote_user_claim: "email ^([^@]+)@"` uses
+  mod_auth_openidc's two-argument regex form (ood-portal-generator emits the value verbatim)
+  to map `demo@example.com` → `demo` — a useradd-valid name that matches nginx_stage's
+  `user_regex`. Applied in both `userdata.sh` and `bake.sh`; the provisioning hook receives
+  the same REMOTE_USER via `--user`, so #39/#67/#71 stay consistent. The oidc-auth-broker
+  (SSH/PAM path, no regex support) now keys on `email`. Single-domain assumption: same
+  local-part across two domains would collide.
 - Cognito `redirect_mismatch` at the start of login (#73). The #64 change added
   `X-Forwarded-Port` to `OIDCXForwardedHeaders`, so mod_auth_openidc began appending the
   ALB's `:443` to the redirect_uri (`https://host:443/oidc`) — but the Cognito callback

@@ -216,9 +216,11 @@ oidc_discover_root: /var/www/ood/discover
 oidc_provider_metadata_url: "${OIDC_ISSUER_URL}/.well-known/openid-configuration"
 oidc_client_id: "${OIDC_CLIENT_ID}"
 oidc_client_secret: "${OIDC_CLIENT_SECRET}"
-# #64: cognito:username is always emitted; preferred_username is not (pool signs in by
-# email). Keep in sync with userdata.sh and the ood-provision-user hook.
-oidc_remote_user_claim: "cognito:username"
+# #75: key on the email claim and regex-extract the local-part as the Unix username
+# (demo@example.com → demo). cognito:username is the sub UUID under email-login, which
+# useradd rejects. ood-portal-generator emits OIDCRemoteUserClaim verbatim, so the
+# two-arg "<claim> <regex>" form works. Keep in sync with userdata.sh + the provisioning hook.
+oidc_remote_user_claim: "email ^([^@]+)@"
 oidc_scope: "openid email profile"
 oidc_session_inactivity_timeout: 28800
 oidc_session_max_duration: 28800
