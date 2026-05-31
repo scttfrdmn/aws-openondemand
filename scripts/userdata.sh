@@ -623,6 +623,53 @@ v2:
 BRAKETCONF
 fi
 
+# Router meta-adapter cluster config (#6): dispatches by job-spec content to the
+# backend adapters under /usr/local/lib/ood-adapters (which must also be enabled).
+if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('router' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
+  echo "=== Configuring router cluster ==="
+  cat > /etc/ood/config/clusters.d/aws-router.yml <<ROUTERCONF
+---
+v2:
+  metadata:
+    title: "AWS (auto-route)"
+    hidden: false
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/lib/ood-adapters/ood-router-adapter"
+      args:
+        - submit
+        - "--region=${AWS_REGION}"
+        - "--adapters-dir=/usr/local/lib/ood-adapters"
+ROUTERCONF
+fi
+
+# Burst meta-adapter cluster config (#5): submits locally until the local queue is
+# busy, then bursts to the cloud adapter. Operators set the local/cloud adapter paths
+# to match their site (the cloud default here is Batch).
+if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('burst' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
+  echo "=== Configuring burst cluster ==="
+  cat > /etc/ood/config/clusters.d/aws-burst.yml <<BURSTCONF
+---
+v2:
+  metadata:
+    title: "AWS (burst overflow)"
+    hidden: false
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/lib/ood-adapters/ood-burst-adapter"
+      args:
+        - submit
+        - "--region=${AWS_REGION}"
+        - "--local-adapter=/usr/local/lib/ood-adapters/ood-slurm-adapter"
+        - "--cloud-adapter=/usr/local/lib/ood-adapters/ood-aws-batch-adapter"
+        - "--queue-threshold=10"
+BURSTCONF
+fi
+
 ###############################################################################
 # 6. Configure PUN session cache (ElastiCache Redis, Level 5)
 ###############################################################################

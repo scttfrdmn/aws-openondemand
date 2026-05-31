@@ -865,6 +865,11 @@ export class OodStack extends cdk.Stack {
       );
     }
 
+    // --- router / burst meta-adapters (#6 / #5): intentionally NO IAM here. They are
+    // dispatchers that shell out to the backend adapters; the AWS permissions come from
+    // those backends' own policies (enable the backends in adaptersEnabled too). Mirrors
+    // the Terraform side, which likewise adds no policy for router/burst. ---
+
     // --- EMR Serverless adapter (mirror aws_iam_role_policy.emr_adapter) ---
     if (adaptersEnabled.includes("emr") && emrApp) {
       instanceRole.addToPrincipalPolicy(

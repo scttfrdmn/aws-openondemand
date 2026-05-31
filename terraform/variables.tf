@@ -167,10 +167,10 @@ variable "enable_cloudwatch_accounting" {
 variable "adapters_enabled" {
   type        = list(string)
   default     = []
-  description = "Compute backends to wire up: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket, bedrock. Infrastructure (IAM, queues, domains) is created per entry."
+  description = "Compute backends to wire up: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket, bedrock, plus the meta-adapters router and burst. Infrastructure (IAM, queues, domains) is created per backend entry. router/burst are dispatchers that shell out to the backend adapters and add no IAM of their own — enable the backends they route to as well."
   validation {
-    condition     = alltrue([for a in var.adapters_enabled : contains(["batch", "sagemaker", "sagemaker-training", "ec2", "omics", "emr", "fargate", "stepfunctions", "braket", "bedrock"], a)])
-    error_message = "adapters_enabled entries must be one of: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket, bedrock."
+    condition     = alltrue([for a in var.adapters_enabled : contains(["batch", "sagemaker", "sagemaker-training", "ec2", "omics", "emr", "fargate", "stepfunctions", "braket", "bedrock", "router", "burst"], a)])
+    error_message = "adapters_enabled entries must be one of: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket, bedrock, router, burst."
   }
 }
 
