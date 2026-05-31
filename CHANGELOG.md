@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Web-login account provisioning is now wired through the correct OOD config and mechanism
+  (#71). `pre_hook_root_cmd` is a per-invocation `nginx_stage pun` CLI option, not a global
+  `nginx_stage.yml` key — so both #67 (right key, wrong file) and #69 (nginx_stage key) were
+  rejected as invalid options and the hook never ran. The supported path (verified against
+  OOD 4.0.10 source) is `ood_portal.yml`: set `pun_pre_hook_root_cmd` (+ `pun_pre_hook_exports`)
+  there → ood-portal-generator emits `SetEnv OOD_PUN_PRE_HOOK_ROOT_CMD` into the Apache vhost
+  → mod_ood_proxy passes `--pre-hook-root` to `nginx_stage pun` at PUN staging. Moved the keys
+  to `ood_portal.yml`, removed the ineffective `nginx_stage.yml` block, and added a boot
+  assertion that the generated `ood-portal.conf` actually carries the `OOD_PUN_PRE_HOOK_ROOT_CMD`
+  SetEnv.
 - Corrected the nginx_stage pre-hook key so #67 actually takes effect (#69). The #67 fix used
   `pun_pre_hook_root_cmd`, but OOD 4.0.x's nginx_stage option is `pre_hook_root_cmd` (no
   `pun_` prefix) — the prefixed key is rejected as an invalid option and silently ignored, so
