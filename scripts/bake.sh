@@ -216,7 +216,9 @@ oidc_discover_root: /var/www/ood/discover
 oidc_provider_metadata_url: "${OIDC_ISSUER_URL}/.well-known/openid-configuration"
 oidc_client_id: "${OIDC_CLIENT_ID}"
 oidc_client_secret: "${OIDC_CLIENT_SECRET}"
-oidc_remote_user_claim: "preferred_username"
+# #64: cognito:username is always emitted; preferred_username is not (pool signs in by
+# email). Keep in sync with userdata.sh and the ood-provision-user hook.
+oidc_remote_user_claim: "cognito:username"
 oidc_scope: "openid email profile"
 oidc_session_inactivity_timeout: 28800
 oidc_session_max_duration: 28800

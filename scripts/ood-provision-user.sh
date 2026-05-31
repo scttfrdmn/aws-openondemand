@@ -7,8 +7,9 @@
 # OOD's account-materialization step — it allocates a stable UID from the DynamoDB UID
 # map and creates the account so the home (EFS-backed /home) and PUN can come up.
 #
-# Identity: pam_exec passes PAM_USER (the preferred_username claim). The DynamoDB table is
-# keyed on `username` because that is the only identity available at this hook.
+# Identity: pam_exec passes PAM_USER, which OOD sets from oidc_remote_user_claim
+# (cognito:username — see #64). The DynamoDB table is keyed on `username` because that is
+# the only identity available at this hook.
 #
 # Idempotent and fail-soft: if anything goes wrong we log and exit 0 so we never block a
 # session for a user that already exists; a genuinely missing account simply won't have a

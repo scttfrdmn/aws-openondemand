@@ -222,7 +222,7 @@ oidc:
       client_secret: "${OOD_OIDC_CLIENT_SECRET}"
       scopes: ["openid", "email", "profile"]
       user_mapping:
-        username_claim: "preferred_username"
+        username_claim: "cognito:username" # #64: always present; preferred_username is not (pool signs in by email)
         email_claim: "email"
         name_claim: "name"
       priority: 1
@@ -341,7 +341,12 @@ oidc_discover_root: /var/www/ood/discover
 oidc_provider_metadata_url: "${OOD_OIDC_ISSUER_URL}/.well-known/openid-configuration"
 oidc_client_id: "${OOD_OIDC_CLIENT_ID}"
 oidc_client_secret: "${OOD_OIDC_CLIENT_SECRET}"
-oidc_remote_user_claim: "preferred_username"
+# #64: key on cognito:username, which Cognito ALWAYS emits in the ID token. The pool uses
+# username_attributes = ["email"] and does not populate preferred_username, so keying on
+# preferred_username made the callback fail with HTTP 400 (claim absent from the token).
+# Must stay in sync with the broker username_claim (above) and the ood-provision-user hook,
+# which turns this claim into the local Unix account name.
+oidc_remote_user_claim: "cognito:username"
 oidc_scope: "openid email profile"
 oidc_session_inactivity_timeout: 28800
 oidc_session_max_duration: 28800
@@ -349,11 +354,14 @@ oidc_session_max_duration: 28800
 # HTTP on :80. Without this, mod_auth_openidc derives the OIDC redirect_uri scheme from
 # the (HTTP) request and builds an http:// redirect_uri, which Cognito rejects (OIDC
 # requires https except for localhost) and which mismatches the registered https callback.
-# OIDCXForwardedHeaders makes mod_auth_openidc honor the ALB's X-Forwarded-Proto/Host so it
+# OIDCXForwardedHeaders makes mod_auth_openidc honor the ALB's forwarded headers so it
 # builds an https:// redirect_uri. ood-portal-generator passes oidc_settings through into
 # the mod_auth_openidc <Macro> block verbatim.
+# #64: list exactly what the ALB sends — X-Forwarded-Proto and X-Forwarded-Port. The ALB
+# does NOT send X-Forwarded-Host, so listing it (as the original #60 fix did) only produced
+# "configured but not found" warnings; X-Forwarded-Proto is what fixes the http→https scheme.
 oidc_settings:
-  OIDCXForwardedHeaders: "X-Forwarded-Proto X-Forwarded-Host"
+  OIDCXForwardedHeaders: "X-Forwarded-Proto X-Forwarded-Port"
 # No user_map_cmd: OOD maps the authenticated identity to a local user via
 # oidc_remote_user_claim (above). oidc-pam v0.3.x provides no map command — the
 # /usr/local/bin/oidc-pam map-user path never existed (scttfrdmn/oidc-pam#87).
