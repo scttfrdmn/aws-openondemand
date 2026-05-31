@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Corrected the nginx_stage pre-hook key so #67 actually takes effect (#69). The #67 fix used
+  `pun_pre_hook_root_cmd`, but OOD 4.0.x's nginx_stage option is `pre_hook_root_cmd` (no
+  `pun_` prefix) — the prefixed key is rejected as an invalid option and silently ignored, so
+  provisioning still never ran on web login. Renamed to `pre_hook_root_cmd` and removed the
+  `pun_pre_hook_exports` block entirely (nginx_stage 4.0.x has no exports option; the hook
+  receives only `--user`, and the helper already reads the UID table/region from
+  `/etc/oidc-auth/provision.env`). Added a boot assertion that fails loudly if nginx_stage
+  rejects a config option, so a wrong key name can't silently slip through again.
 - Local accounts are now provisioned on **web** login, so the PUN starts (#67). The #39
   provisioning hook was wired only as a `session` `pam_exec` entry in `/etc/pam.d/ood`, but
   OOD's web-auth path (mod_auth_openidc → mod_ood_proxy → nginx_stage) never opens a PAM
