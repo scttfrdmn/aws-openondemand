@@ -475,6 +475,26 @@ v2:
 OMICSCONF
 fi
 
+# Bedrock batch-inference adapter cluster config
+if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('bedrock' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
+  echo "=== Configuring Bedrock cluster ==="
+  cat > /etc/ood/config/clusters.d/aws-bedrock.yml <<BEDROCKCONF
+---
+v2:
+  metadata:
+    title: "AWS Bedrock"
+    hidden: false
+  job:
+    adapter: "adapter_script"
+    submit_host: "localhost"
+    submit:
+      script: "/usr/local/lib/ood-adapters/ood-bedrock-adapter"
+      args:
+        - submit
+        - "--region=${AWS_REGION}"
+BEDROCKCONF
+fi
+
 # EMR Serverless adapter cluster config
 if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('emr' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
   echo "=== Configuring EMR Serverless cluster ==="

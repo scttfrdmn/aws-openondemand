@@ -167,10 +167,10 @@ variable "enable_cloudwatch_accounting" {
 variable "adapters_enabled" {
   type        = list(string)
   default     = []
-  description = "Compute backends to wire up: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket. Infrastructure (IAM, queues, domains) is created per entry."
+  description = "Compute backends to wire up: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket, bedrock. Infrastructure (IAM, queues, domains) is created per entry."
   validation {
-    condition     = alltrue([for a in var.adapters_enabled : contains(["batch", "sagemaker", "sagemaker-training", "ec2", "omics", "emr", "fargate", "stepfunctions", "braket"], a)])
-    error_message = "adapters_enabled entries must be one of: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket."
+    condition     = alltrue([for a in var.adapters_enabled : contains(["batch", "sagemaker", "sagemaker-training", "ec2", "omics", "emr", "fargate", "stepfunctions", "braket", "bedrock"], a)])
+    error_message = "adapters_enabled entries must be one of: batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket, bedrock."
   }
 }
 

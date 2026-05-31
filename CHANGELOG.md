@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Bedrock batch-inference backend wired as a compute adapter (#11): `adapters_enabled`
+  accepts `bedrock`, with a scoped IAM policy (`bedrock:*ModelInvocationJob*` +
+  `iam:PassRole` to `bedrock.amazonaws.com`) and an `aws-bedrock.yml` OOD cluster generator.
+  Pairs with the new [`ood-bedrock-adapter`](https://github.com/scttfrdmn/ood-bedrock-adapter)
+  (`CreateModelInvocationJob`/`GetModelInvocationJob`/`StopModelInvocationJob`) and the
+  `aws-bedrock` app bundle in ood-apps. Landed in both Terraform and CDK (dual-IaC parity).
 - `docs/adapter-guide.md` + `README.md`: documented
   [`ood-staging-wrapper`](https://github.com/scttfrdmn/ood-staging-wrapper) — a transparent
   S3 data-staging layer that wraps an inner adapter so S3-native backends (SageMaker

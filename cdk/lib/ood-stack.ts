@@ -838,6 +838,30 @@ export class OodStack extends cdk.Stack {
       );
     }
 
+    // --- Bedrock batch-inference adapter (mirror aws_iam_role_policy.bedrock_adapter) ---
+    if (adaptersEnabled.includes("bedrock")) {
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "bedrock:CreateModelInvocationJob",
+            "bedrock:GetModelInvocationJob",
+            "bedrock:StopModelInvocationJob",
+            "bedrock:ListModelInvocationJobs",
+          ],
+          resources: ["*"],
+        })
+      );
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          // Bedrock assumes the passed role to read/write the S3 manifests; S3 access
+          // lives on that role, not the instance role.
+          actions: ["iam:PassRole"],
+          resources: ["*"],
+          conditions: { StringEquals: { "iam:PassedToService": "bedrock.amazonaws.com" } },
+        })
+      );
+    }
+
     // --- EMR Serverless adapter (mirror aws_iam_role_policy.emr_adapter) ---
     if (adaptersEnabled.includes("emr") && emrApp) {
       instanceRole.addToPrincipalPolicy(
