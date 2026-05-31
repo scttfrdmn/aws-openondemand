@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Local accounts are now provisioned on **web** login, so the PUN starts (#67). The #39
+  provisioning hook was wired only as a `session` `pam_exec` entry in `/etc/pam.d/ood`, but
+  OOD's web-auth path (mod_auth_openidc → mod_ood_proxy → nginx_stage) never opens a PAM
+  session — so the hook never fired on browser login, no Unix account was created, and
+  `nginx_stage` failed with "can't find user" (generic OOD error page after a fully
+  successful OIDC login). Wired `nginx_stage`'s `pun_pre_hook_root_cmd` (runs as root before
+  the PUN starts, with the mapped user) to `ood-provision-user`, and taught the script to
+  accept `--user <name>` in addition to `$PAM_USER`. The web path also creates the home dir
+  directly (`useradd --create-home`) since `pam_mkhomedir` doesn't run there. The DynamoDB
+  UID-allocation logic is unchanged; only the trigger moved into the web-login lifecycle.
 - OIDC callback no longer 400s on a missing identity claim (#64). The portal keyed on the
   `preferred_username` claim, but the Cognito pool signs users in by email
   (`username_attributes = ["email"]`) and never emits `preferred_username`, so

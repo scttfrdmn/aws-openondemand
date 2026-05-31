@@ -270,8 +270,9 @@ BROKERCONF
 
   # Configure PAM for OOD authentication. Order matters: pam_oidc authenticates, then the
   # provisioning hook creates the local account (#39), then pam_mkhomedir creates its home
-  # (on the EFS-mounted /home). pam_exec passes PAM_USER and inherits OOD_DYNAMODB_UID_TABLE
-  # / AWS_REGION exported here so the helper can reach the UID map.
+  # (on the EFS-mounted /home). This path covers INTERACTIVE logins (ssh/su) which open a
+  # PAM session. NOTE (#67): OOD's WEB login does NOT open a PAM session, so this entry does
+  # not fire on browser login — the nginx_stage pre-hook below is the web-login trigger.
   cat > /etc/pam.d/ood <<PAMCONF
 auth     required pam_oidc.so
 account  required pam_oidc.so
@@ -279,6 +280,22 @@ session  optional pam_oidc.so
 session  optional pam_exec.so /usr/local/bin/ood-provision-user
 session  optional pam_mkhomedir.so skel=/etc/skel umask=0077
 PAMCONF
+
+  # #67: provision the local account on the WEB-login path. OOD web auth goes
+  # mod_auth_openidc -> mod_ood_proxy -> nginx_stage and never opens a PAM session, so the
+  # pam_exec entry above can't fire. nginx_stage's pun_pre_hook_root_cmd runs as root before
+  # the PUN starts and is invoked with `--user <mapped-user>` — the correct hook for
+  # materializing the account. ood-provision-user accepts --user as well as $PAM_USER.
+  if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
+    mkdir -p /etc/ood/config
+    cat >> /etc/ood/config/nginx_stage.yml <<NGINX_STAGE_HOOK
+# #67: create the local Unix account (UID from DynamoDB) before the PUN starts.
+pun_pre_hook_root_cmd: '/usr/local/bin/ood-provision-user'
+pun_pre_hook_exports:
+  - OOD_DYNAMODB_UID_TABLE
+  - AWS_REGION
+NGINX_STAGE_HOOK
+  fi
 
   # Make the UID-map table + region available to the pam_exec helper environment.
   if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
