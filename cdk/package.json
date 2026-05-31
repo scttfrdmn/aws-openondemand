@@ -1,6 +1,6 @@
 {
   "name": "ood-cdk",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "scripts": {
     "build": "tsc",
     "lint": "eslint 'bin/**/*.ts' 'lib/**/*.ts'",

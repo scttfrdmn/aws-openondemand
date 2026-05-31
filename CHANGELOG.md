@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-30
+
+First tagged pre-production release. This is a feasibility / pre-1.0 project: the public
+interface (Terraform variables, CDK context, cluster YAML, deploy flow) is still evolving
+and may change without a major-version bump until a `1.0.0` stability commitment is made.
+
+Earlier `1.0.x` entries (1.0.0, 1.0.1, 1.0.2) were premature version numbers from before
+this convention was adopted; their content is consolidated below. There was never a stable
+public release at those numbers — only a single `v1.0.1` tag, now removed. Full detail is in
+the git history.
+
 ### Fixed
 - `scripts/userdata.sh`: add the `auth:` block to the generated `ood_portal.yml` whenever
   OIDC is configured (#52). ood-portal-generator only emits the mod_auth_openidc vhost when
@@ -133,24 +144,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   positives on count-indexed resources. Added matching inline `#tfsec:ignore` comments
   in `terraform/main.tf`. Result: checkov and tfsec both clean with every finding either
   fixed or justified. No security posture weakened.
-
-## [1.0.2] - 2026-05-29
-
-### Fixed
 - `terraform/main.tf`: launch template no longer inlines the ~18 KB `scripts/userdata.sh` into `user_data`, which exceeded EC2's hard 16,384-byte limit and broke every `terraform apply` (#16). The bootstrap scripts are now staged to a dedicated `ood-artifacts-*` S3 bucket, and `user_data` carries only a ~1.5 KB fetch-verify-exec stub (`aws s3 cp` + `sha256sum -c` + `bash`). Works in no-egress / VPC-endpoint-only deployments via the existing S3 gateway endpoint (the `ood-` bucket prefix is required by the endpoint policy).
 - `cdk/lib/ood-stack.ts`: converged the CDK layer onto the same S3-staging mechanism (artifact `s3.Bucket` + `BucketDeployment` + stub) for dual-IaC parity. Replaced the prior GitHub-raw `curl` delivery, which (a) was unreachable in no-egress deployments and (b) verified against `.sha256` sidecar files that did not exist in the repo, so the checksum check silently no-op'd. The SHA256 is now computed at synth time from the exact uploaded file, so verification is intrinsic and a mismatch hard-fails the boot.
 
 ### Added
+- Open OnDemand on AWS with pluggable compute backends (batch, sagemaker, sagemaker-training, ec2, omics, emr, fargate, stepfunctions, braket), dual Terraform + CDK IaC producing identical infrastructure, cloud-native identity via oidc-pam, and the cloud-native progression toggle model. (Foundational work from the earlier 1.0.0/1.0.1 entries — security hardening rounds and the initial compute-adapter wiring; see git history.)
 - `terraform/main.tf`: `aws_s3_bucket.artifacts` (+ public-access block, SSE, versioning, TLS/encryption-deny policy), `aws_s3_object.userdata` / `aws_s3_object.bake`, and `aws_iam_role_policy.artifacts_read` (scoped `s3:GetObject`/`ListBucket`).
 - `terraform/main.tf`: `bake.sh` is now staged and run at boot on the base-AMI path (`enable_packer_ami = false`), closing a latent gap where the Terraform inline path omitted it entirely.
-- `CHANGELOG.md`: this file, adopting the Keep a Changelog + SemVer 2.0.0 convention used across the project ecosystem.
-
-## [1.0.1]
-
-### Added
-- Security hardening rounds and compute adapter wiring (see git history).
-
-## [1.0.0]
-
-### Added
-- Initial release: Open OnDemand on AWS with pluggable compute backends, dual Terraform + CDK IaC, cloud-native identity via oidc-pam, and the cloud-native progression toggle model.
+- `CHANGELOG.md`: adopting the Keep a Changelog + SemVer 2.0.0 convention used across the project ecosystem.
