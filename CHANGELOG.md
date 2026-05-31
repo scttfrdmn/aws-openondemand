@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Two meta-adapters wired into `adapters_enabled` (TF + CDK): `router` (#6) dispatches by
+  job-spec content to the best AWS backend, and `burst` (#5) submits locally until the local
+  scheduler queue is busy then overflows to AWS. Both are dispatchers that shell out to the
+  backend adapters and carry **no IAM of their own** — the backends they route to supply the
+  permissions, so enable those too. `userdata.sh` generates `aws-router.yml` / `aws-burst.yml`
+  cluster configs. Pairs with the new
+  [`ood-router-adapter`](https://github.com/scttfrdmn/ood-router-adapter) and
+  [`ood-burst-adapter`](https://github.com/scttfrdmn/ood-burst-adapter).
+
 ### Fixed
 - ALB target group is no longer permanently unhealthy once OIDC is wired (#59). The health
   check on `/pun/sys/dashboard` now accepts `200,301,302` (TF `matcher` / CDK
