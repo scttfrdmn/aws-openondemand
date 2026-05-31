@@ -363,11 +363,15 @@ oidc_session_max_duration: 28800
 # OIDCXForwardedHeaders makes mod_auth_openidc honor the ALB's forwarded headers so it
 # builds an https:// redirect_uri. ood-portal-generator passes oidc_settings through into
 # the mod_auth_openidc <Macro> block verbatim.
-# #64: list exactly what the ALB sends — X-Forwarded-Proto and X-Forwarded-Port. The ALB
-# does NOT send X-Forwarded-Host, so listing it (as the original #60 fix did) only produced
-# "configured but not found" warnings; X-Forwarded-Proto is what fixes the http→https scheme.
+# #73: ONLY X-Forwarded-Proto. That alone fixes the http→https scheme (the #60/#64 goal).
+# Honoring X-Forwarded-Port too made mod_auth_openidc append the ALB's :443 to the
+# redirect_uri (https://host:443/oidc), but the Cognito callback registered by terraform/CDK
+# is port-less (https://host/oidc), and Cognito does exact-string matching → redirect_mismatch
+# before login. :443 is the https default and adds nothing, so dropping it keeps the
+# redirect_uri byte-identical to the registered callback. (X-Forwarded-Host is also omitted —
+# the ALB does not send it.)
 oidc_settings:
-  OIDCXForwardedHeaders: "X-Forwarded-Proto X-Forwarded-Port"
+  OIDCXForwardedHeaders: "X-Forwarded-Proto"
 # No user_map_cmd: OOD maps the authenticated identity to a local user via
 # oidc_remote_user_claim (above). oidc-pam v0.3.x provides no map command — the
 # /usr/local/bin/oidc-pam map-user path never existed (scttfrdmn/oidc-pam#87).
