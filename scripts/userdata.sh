@@ -281,34 +281,10 @@ session  optional pam_exec.so /usr/local/bin/ood-provision-user
 session  optional pam_mkhomedir.so skel=/etc/skel umask=0077
 PAMCONF
 
-  # #67: provision the local account on the WEB-login path. OOD web auth goes
-  # mod_auth_openidc -> mod_ood_proxy -> nginx_stage and never opens a PAM session, so the
-  # pam_exec entry above can't fire. nginx_stage's pre_hook_root_cmd runs as root before the
-  # PUN starts and is invoked with ONLY `--user <mapped-user>` — the correct hook for
-  # materializing the account. ood-provision-user accepts --user as well as $PAM_USER.
-  #
-  # #69: the nginx_stage key is `pre_hook_root_cmd` (NOT `pun_pre_hook_root_cmd` — that
-  # prefixed name is rejected as an invalid option and silently ignored, so the hook never
-  # runs). There is no exports option in nginx_stage 4.0.x (the hook receives only --user),
-  # so the helper reads OOD_DYNAMODB_UID_TABLE / AWS_REGION from /etc/oidc-auth/provision.env
-  # (written below) rather than from the hook environment.
-  if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
-    mkdir -p /etc/ood/config
-    cat >> /etc/ood/config/nginx_stage.yml <<NGINX_STAGE_HOOK
-# #67/#69: create the local Unix account (UID from DynamoDB) before the PUN starts.
-pre_hook_root_cmd: '/usr/local/bin/ood-provision-user'
-NGINX_STAGE_HOOK
-
-    # #69: assert nginx_stage actually accepts the key — a wrong option name is only a
-    # warning (silently ignored), which is exactly how the pun_-prefixed key slipped
-    # through. Fail loudly so a bad key is caught at boot instead of at first login.
-    if [ -x /opt/ood/nginx_stage/sbin/nginx_stage ]; then
-      if /opt/ood/nginx_stage/sbin/nginx_stage pun --user=__provision_probe__ 2>&1 \
-           | grep -q 'invalid configuration option'; then
-        echo "ERROR: nginx_stage rejected a config option in nginx_stage.yml (#69) — the pre_hook_root_cmd key is wrong and account provisioning will NOT run on web login."
-      fi
-    fi
-  fi
+  # #67/#69/#71: account provisioning on the WEB-login path is wired through ood_portal.yml's
+  # `pun_pre_hook_root_cmd` (NOT nginx_stage.yml — see the ood_portal.yml generation below for
+  # the full mechanism trace). OOD web auth never opens a PAM session, so the pam_exec entry
+  # above only covers interactive (ssh/su) logins.
 
   # Make the UID-map table + region available to the pam_exec helper environment.
   if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
@@ -408,9 +384,34 @@ auth:
   - 'Require valid-user'
 OODPORTAL
 
+  # #71: wire account provisioning on the WEB-login path through ood_portal.yml — NOT
+  # nginx_stage.yml. Mechanism (verified against OOD 4.0.10 source):
+  #   1. ood-portal-generator (view.rb) reads `pun_pre_hook_root_cmd` / `pun_pre_hook_exports`
+  #      from ood_portal.yml.
+  #   2. It emits `SetEnv OOD_PUN_PRE_HOOK_ROOT_CMD ...` / `OOD_PUN_PRE_HOOK_EXPORTS ...` into
+  #      the Apache vhost (ood-portal.conf).
+  #   3. mod_ood_proxy/Lua forward those to `nginx_stage pun --pre-hook-root=<cmd>` at PUN
+  #      staging time, which runs the hook as root with `--user <mapped-user>`.
+  # `pre_hook_root_cmd` is a per-invocation nginx_stage CLI option (default nil) and is NOT a
+  # valid global nginx_stage.yml key — earlier attempts (#67 in the wrong file, #69 with the
+  # nginx_stage key) were both rejected as invalid options. The exports list IS honored here
+  # (unlike nginx_stage.yml), so we forward the UID table + region; the helper also still
+  # falls back to /etc/oidc-auth/provision.env.
+  if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
+    cat >> /etc/ood/config/ood_portal.yml <<PORTALHOOK
+pun_pre_hook_root_cmd: "/usr/local/bin/ood-provision-user"
+pun_pre_hook_exports: "OOD_DYNAMODB_UID_TABLE,AWS_REGION"
+PORTALHOOK
+  fi
+
   # Regenerate OOD Apache config from the portal YAML
   if command -v /opt/ood/ood-portal-generator/sbin/update_ood_portal &>/dev/null; then
     /opt/ood/ood-portal-generator/sbin/update_ood_portal
+    # #71: confirm the generated Apache config actually carries the pre-hook SetEnv — if the
+    # generator silently dropped the key, provisioning won't run on web login. Warn loudly.
+    if [ -n "${OOD_DYNAMODB_UID_TABLE}" ] && ! grep -q "OOD_PUN_PRE_HOOK_ROOT_CMD" /etc/httpd/conf.d/ood-portal.conf 2>/dev/null; then
+      echo "ERROR: ood-portal.conf has no OOD_PUN_PRE_HOOK_ROOT_CMD SetEnv (#71) — account provisioning will NOT run on web login; check the pun_pre_hook_root_cmd key in ood_portal.yml."
+    fi
     # #38/#52: the generator silently degrades to the need_auth fallback (RewriteRule ->
     # /public/need_auth.html) if mod_auth_openidc isn't loadable OR the auth: block is
     # missing. Assert the rendered vhost actually carries the OIDC directive
