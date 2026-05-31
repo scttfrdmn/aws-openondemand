@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Cognito `redirect_mismatch` at the start of login (#73). The #64 change added
+  `X-Forwarded-Port` to `OIDCXForwardedHeaders`, so mod_auth_openidc began appending the
+  ALB's `:443` to the redirect_uri (`https://host:443/oidc`) — but the Cognito callback
+  registered by Terraform/CDK is port-less (`https://host/oidc`), and Cognito matches the
+  redirect_uri by exact string, so login failed before authentication. Dropped
+  `X-Forwarded-Port`, keeping only `X-Forwarded-Proto` (which is what fixes the http→https
+  scheme; `:443` is the https default and adds nothing). The emitted redirect_uri is now
+  byte-identical to the registered callback.
 - Web-login account provisioning is now wired through the correct OOD config and mechanism
   (#71). `pre_hook_root_cmd` is a per-invocation `nginx_stage pun` CLI option, not a global
   `nginx_stage.yml` key — so both #67 (right key, wrong file) and #69 (nginx_stage key) were
