@@ -113,31 +113,32 @@ aws ec2 terminate-instances --instance-ids i-xxx
 
 ## Teardown
 
-Two resources have `lifecycle { prevent_destroy = true }` because they hold persistent
-user data that cannot be recreated without data loss:
+Deletion protection is **environment-aware** (#79). It is keyed on `environment == "prod"`
+via AWS-native controls (Cognito `deletion_protection`, DynamoDB `deletion_protection_enabled`,
+S3 `force_destroy`) rather than Terraform's `lifecycle.prevent_destroy` — which couldn't read
+a variable and previously blocked any teardown all-or-nothing.
 
-- `aws_cognito_user_pool.ood` — contains all user accounts and MFA enrollments
-- `aws_dynamodb_table.uid_map` — contains all OIDC→Unix UID mappings
-
-`terraform destroy` will **block** on these resources by design. The correct teardown
-sequence is:
+### Non-prod (`test` / `staging`) — one clean pass
 
 ```bash
-# 1. Remove the protected resources from Terraform state (does NOT delete them yet)
-terraform state rm 'aws_cognito_user_pool.ood[0]' 'aws_dynamodb_table.uid_map[0]'
-
-# 2. Destroy everything else
 terraform destroy -var-file=environments/ENVIRONMENT.tfvars
-
-# 3. Manually delete the identity resources (IRREVERSIBLE — all user accounts lost)
-POOL_ID=$(aws cognito-idp list-user-pools --max-results 10 \
-  --query "UserPools[?Name=='ood-ENVIRONMENT'].Id" --output text)
-aws cognito-idp delete-user-pool --user-pool-id "$POOL_ID"
-aws dynamodb delete-table --table-name oid-uid-map-ENVIRONMENT
-
-# 4. Tear down the Terraform state backend (optional, if shutting down entirely)
-./scripts/teardown-terraform-backend.sh
 ```
 
-> **Warning:** Step 3 permanently deletes all user accounts and UID mappings. In staging
-> and prod, export user data first or coordinate with affected users before proceeding.
+No `state rm`, no manual CLI cleanup. The Cognito pool, DynamoDB uid_map, versioned buckets
+(artifacts / alb_logs / ssm_sessions / cdn_logs / flow_logs / cloudtrail), and the Batch
+compute environment all destroy in a single pass. (Optionally tear down the state backend
+afterward with `./scripts/teardown-terraform-backend.sh`.)
+
+> **Warning:** in non-prod this permanently deletes the Cognito user pool, all UID mappings,
+> and all bucket contents. That's intended for disposable test/staging stacks — make sure the
+> environment really is disposable before running it.
+
+### Prod — protection is ON by design
+
+In `prod`, Cognito and DynamoDB have native deletion protection enabled and the buckets are
+**not** `force_destroy`, so `terraform destroy` will refuse to remove them — preventing
+accidental loss of user accounts, UID mappings, and audit logs. To intentionally tear down a
+prod stack, first disable protection out-of-band (e.g.
+`aws cognito-idp update-user-pool --deletion-protection INACTIVE`,
+`aws dynamodb update-table --no-deletion-protection-enabled`, empty + delete the retained
+buckets), then `terraform destroy`. This friction is deliberate.

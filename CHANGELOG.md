@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `terraform destroy` (and `cdk destroy`) of a non-prod env is now one clean pass (#79). Three
+  fixes, both IaC paths:
+  1. **Env-aware deletion protection** — replaced the un-conditional `lifecycle.prevent_destroy`
+     on the Cognito pool / DynamoDB uid_map / audit buckets (which can't read a variable and
+     blocked teardown all-or-nothing, forcing manual `state rm` + orphan risk) with
+     AWS-native, expression-driven protection keyed on a new `prod_protected` local: Cognito
+     `deletion_protection`, DynamoDB `deletion_protection_enabled`, and `force_destroy` on the
+     versioned buckets — all ON for prod, OFF for non-prod. CDK mirrors via `deletionProtection`
+     / env-aware `removalPolicy` + `autoDeleteObjects`.
+  2. **Versioned buckets self-empty** — `force_destroy` (TF) / `autoDeleteObjects` (CDK) on
+     artifacts / alb_logs / ssm_sessions / cdn_logs / flow_logs / cloudtrail(+logs) so
+     `DeleteBucket` no longer fails `BucketNotEmpty` on leftover object versions/delete-markers.
+  3. **Batch CE tears down cleanly** — added the ECS teardown actions (`ecs:ListClusters`,
+     `DescribeClusters`, `ListContainerInstances`, `DescribeContainerInstances`, `DeleteCluster`,
+     `DeregisterContainerInstance`, `UpdateContainerInstancesState`) to the Batch service role,
+     which the AWS-managed `AWSBatchServiceRole` lacks — without them the compute environment
+     goes `INVALID` on destroy and can't be deleted (orphan + blocked teardown). Queue-before-CE
+     ordering is already enforced by the implicit dependency. Prod protection is unchanged.
 - PUN 404 after a successful login (#75). With `username_attributes = ["email"]`, the
   `cognito:username` claim chosen in #64 is the Cognito `sub` UUID, which `useradd` rejects as
   an invalid name → no local account → `/pun/sys/dashboard` 404s. Switched the web identity

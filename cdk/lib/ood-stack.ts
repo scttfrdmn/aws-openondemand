@@ -93,6 +93,11 @@ export class OodStack extends cdk.Stack {
 
     const config = ENV_CONFIG[props.environment];
 
+    // #79: deletion protection / RETAIN only in prod, so non-prod `cdk destroy` is one clean
+    // pass (mirrors the Terraform `prod_protected` local). Drives Cognito/DynamoDB protection,
+    // RemovalPolicy, and S3 autoDeleteObjects below.
+    const prodProtected = props.environment === "prod";
+
     // --- Context-based configuration (same pattern as aws-hubzero) ---
     const deploymentProfile =
       this.node.tryGetContext("deploymentProfile") || "minimal";
@@ -303,10 +308,12 @@ export class OodStack extends cdk.Stack {
         blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
         enforceSSL: true, // mirrors the DenyHTTP (aws:SecureTransport=false) statement
         versioned: true, // H5: versioning detects log tampering
-        removalPolicy:
-          props.environment === "prod"
-            ? cdk.RemovalPolicy.RETAIN
-            : cdk.RemovalPolicy.DESTROY,
+        removalPolicy: prodProtected
+          ? cdk.RemovalPolicy.RETAIN
+          : cdk.RemovalPolicy.DESTROY,
+        // #79: non-prod purges objects+versions on destroy (the bucket is versioned, so
+        // without this DeleteBucket fails BucketNotEmpty on leftover versions). prod retains.
+        autoDeleteObjects: !prodProtected,
         lifecycleRules: [
           {
             expiration: cdk.Duration.days(
@@ -359,7 +366,13 @@ export class OodStack extends cdk.Stack {
         mfa: cognitoMfaRequired ? cognito.Mfa.REQUIRED : cognito.Mfa.OPTIONAL,
         mfaSecondFactor: { otp: true, sms: false },
         accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
-        removalPolicy: cdk.RemovalPolicy.RETAIN, // M10: always RETAIN — pool contains all user identities
+        // #79: env-aware (mirrors the Terraform deletion_protection). prod RETAINs the pool
+        // and turns on native deletion protection; non-prod DESTROYs so `cdk destroy` is a
+        // clean one-pass teardown (was an unconditional RETAIN, which orphaned the pool).
+        deletionProtection: prodProtected,
+        removalPolicy: prodProtected
+          ? cdk.RemovalPolicy.RETAIN
+          : cdk.RemovalPolicy.DESTROY,
       });
 
       // #25: domain wins; else the ALB DNS (the precondition above guarantees one exists
@@ -492,10 +505,12 @@ export class OodStack extends cdk.Stack {
           ? dynamodb.TableEncryption.CUSTOMER_MANAGED
           : dynamodb.TableEncryption.AWS_MANAGED,
         encryptionKey: cmk,
-        removalPolicy:
-          props.environment === "prod"
-            ? cdk.RemovalPolicy.RETAIN
-            : cdk.RemovalPolicy.DESTROY,
+        // #79: native deletion protection + RETAIN in prod only; non-prod DESTROYs for a
+        // clean `cdk destroy` (mirrors the Terraform deletion_protection_enabled).
+        deletionProtection: prodProtected,
+        removalPolicy: prodProtected
+          ? cdk.RemovalPolicy.RETAIN
+          : cdk.RemovalPolicy.DESTROY,
       });
 
       if (enableParameterStore) {
@@ -1344,7 +1359,11 @@ export class OodStack extends cdk.Stack {
             ),
           },
         ],
-        removalPolicy: cdk.RemovalPolicy.RETAIN,
+        // #79: env-aware (was unconditional RETAIN, which orphaned the bucket on test destroy).
+        removalPolicy: prodProtected
+          ? cdk.RemovalPolicy.RETAIN
+          : cdk.RemovalPolicy.DESTROY,
+        autoDeleteObjects: !prodProtected,
       });
 
       // L1: security response headers policy — HSTS, X-Frame-Options, content-type nosniff
@@ -1544,6 +1563,23 @@ export class OodStack extends cdk.Stack {
           ),
         ],
       });
+      // #79: AWSBatchServiceRole lacks the ECS actions Batch needs to tear down a managed
+      // CE's underlying ECS cluster; without them the CE goes INVALID on destroy and can't be
+      // deleted (orphan + blocked teardown). Mirrors the Terraform batch_service_ecs_teardown.
+      batchServiceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "ecs:ListClusters",
+            "ecs:DescribeClusters",
+            "ecs:ListContainerInstances",
+            "ecs:DescribeContainerInstances",
+            "ecs:DeleteCluster",
+            "ecs:DeregisterContainerInstance",
+            "ecs:UpdateContainerInstancesState",
+          ],
+          resources: ["*"],
+        })
+      );
 
       // H4: explicit instance family list prevents Batch from selecting
       // expensive families (x2iezn, z1d, etc.) when using "optimal"
