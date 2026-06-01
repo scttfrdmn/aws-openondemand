@@ -75,6 +75,14 @@ locals {
   enable_braket             = contains(var.adapters_enabled, "braket")
   enable_bedrock            = contains(var.adapters_enabled, "bedrock")
 
+  # #79: deletion protection is on only in prod. Terraform's lifecycle.prevent_destroy must
+  # be a literal (can't read a var), and using it blocked `terraform destroy` of a test env
+  # entirely (all-or-nothing) — forcing manual `state rm` and risking orphaned billing
+  # resources. So instead of prevent_destroy we use AWS-native, expression-driven protection
+  # (Cognito deletion_protection, DynamoDB deletion_protection_enabled) and env-aware
+  # S3 force_destroy, all keyed on this flag. prod stays protected; non-prod tears down clean.
+  prod_protected = var.environment == "prod"
+
   # Precondition: spot profile requires cloud-native stack
   # (enforced below via lifecycle precondition on the ASG)
   spot_prereqs_met = !local.use_spot || (var.enable_efs && var.enable_dynamodb_uid && var.use_cognito)
@@ -689,9 +697,11 @@ resource "aws_cognito_user_pool" "ood" {
     allow_admin_create_user_only = true
   }
 
-  lifecycle {
-    prevent_destroy = true # M10: user pool contains identity mappings; accidental destroy loses all users
+  # #79: native deletion protection in prod only (replaces lifecycle.prevent_destroy, which
+  # couldn't be env-aware and blocked test teardown). prod = ACTIVE, non-prod = INACTIVE.
+  deletion_protection = local.prod_protected ? "ACTIVE" : "INACTIVE"
 
+  lifecycle {
     # H2: production portals must enforce MFA — a compromised password alone would grant
     # full portal access including compute submission and EFS home directory reads.
     # Set cognito_mfa_required=true in prod.tfvars after users have enrolled TOTP.
@@ -788,10 +798,12 @@ resource "aws_dynamodb_table" "uid_map" {
   # #39: keyed on `username` (the cognito:username claim — see #64). The account-provisioning
   # PAM hook (pam_exec → ood-provision-user) only receives PAM_USER, not the OIDC sub,
   # so username is the lookup key. Rows are {username, uid}; a "__uid_counter__" sentinel
-  # item holds the next_uid for atomic allocation. (On an existing deployment this key
-  # change forces a replace, which prevent_destroy blocks by design — the table is empty
-  # in practice since this is the first wiring; remove the guard for the one-time rekey.)
+  # item holds the next_uid for atomic allocation.
   hash_key = "username"
+
+  # #79: native deletion protection in prod only (replaces lifecycle.prevent_destroy, which
+  # couldn't be env-aware and blocked test teardown). PITR still recovers rows if needed.
+  deletion_protection_enabled = local.prod_protected
 
   attribute {
     name = "username"
@@ -811,10 +823,6 @@ resource "aws_dynamodb_table" "uid_map" {
 
   tags = {
     Name = "oid-uid-map-${var.environment}"
-  }
-
-  lifecycle {
-    prevent_destroy = true # M10: PITR recovers rows; this prevents accidental table drop
   }
 }
 
@@ -948,12 +956,13 @@ resource "aws_s3_bucket" "ood_files" {
   count         = var.enable_s3_browser ? 1 : 0
   bucket_prefix = "ood-files-${var.environment}-"
 
+  # #79: prod protects user data by refusing to delete a non-empty bucket; non-prod purges
+  # all objects+versions on destroy so `terraform destroy` is one clean pass (was
+  # lifecycle.prevent_destroy, which couldn't be env-aware and blocked test teardown).
+  force_destroy = !local.prod_protected
+
   tags = {
     Name = "ood-files-${var.environment}"
-  }
-
-  lifecycle {
-    prevent_destroy = true # H4: protect user data from accidental destroy
   }
 }
 
@@ -990,6 +999,7 @@ resource "aws_s3_bucket" "ood_files_logs" {
   count         = var.enable_s3_browser ? 1 : 0
   bucket_prefix = "ood-files-logs-${var.environment}-"
   tags          = { Name = "ood-files-logs-${var.environment}" }
+  force_destroy = !local.prod_protected # #79: clean non-prod teardown
 }
 
 resource "aws_s3_bucket_public_access_block" "ood_files_logs" {
@@ -1109,11 +1119,11 @@ resource "aws_s3_bucket" "artifacts" {
     Name = "ood-artifacts-${var.environment}"
   }
 
-  # Unlike ood_files (which holds user data), these are rebuildable artifacts
-  # re-uploaded from source on every apply — destroy must not be blocked.
-  lifecycle {
-    prevent_destroy = false
-  }
+  # Unlike ood_files (which holds user data), these are rebuildable artifacts re-uploaded
+  # from source on every apply. #79: force_destroy in all envs — the bucket is versioned, so
+  # without it DeleteBucket fails with BucketNotEmpty on leftover object versions even after
+  # the current objects are gone (the bucket is always rebuildable, so this is safe in prod).
+  force_destroy = true
 }
 
 resource "aws_s3_bucket_versioning" "artifacts" {
@@ -1593,9 +1603,9 @@ resource "aws_s3_bucket" "alb_logs" {
   bucket_prefix = "ood-alb-logs-${var.environment}-"
   tags          = { Name = "ood-alb-logs-${var.environment}" }
 
-  lifecycle {
-    prevent_destroy = true # H5: preserve audit logs from accidental destroy
-  }
+  # #79: prod preserves audit logs (refuses delete of non-empty bucket); non-prod purges
+  # objects+versions+delete-markers on destroy for a clean one-pass teardown.
+  force_destroy = !local.prod_protected
 }
 
 resource "aws_s3_bucket_public_access_block" "alb_logs" {
@@ -2166,6 +2176,7 @@ resource "aws_s3_bucket" "cdn_logs" {
   count         = var.enable_cdn && var.enable_alb ? 1 : 0
   bucket_prefix = "ood-cdn-logs-${var.environment}-"
   tags          = { Name = "ood-cdn-logs-${var.environment}" }
+  force_destroy = !local.prod_protected # #79: clean non-prod teardown
 }
 
 resource "aws_s3_bucket_public_access_block" "cdn_logs" {
@@ -2544,9 +2555,8 @@ resource "aws_s3_bucket" "ssm_sessions" {
   bucket_prefix = "ood-ssm-sessions-${var.environment}-"
   tags          = { Name = "ood-ssm-sessions-${var.environment}" }
 
-  lifecycle {
-    prevent_destroy = true
-  }
+  # #79: prod preserves session transcripts; non-prod purges on destroy for clean teardown.
+  force_destroy = !local.prod_protected
 }
 
 resource "aws_s3_bucket_public_access_block" "ssm_sessions" {
@@ -2671,6 +2681,33 @@ resource "aws_iam_role_policy_attachment" "batch_service" {
   count      = local.enable_batch ? 1 : 0
   role       = aws_iam_role.batch_service[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole"
+}
+
+# #79: the AWS-managed AWSBatchServiceRole lacks the ECS actions Batch needs to tear down a
+# managed compute environment's underlying ECS cluster. Without these, on `terraform destroy`
+# the CE goes INVALID (statusReason: not authorized to perform ecs:ListClusters) and can't be
+# deleted — blocking the whole destroy and risking an orphaned (billable) CE. Grant the ECS
+# teardown actions explicitly so the CE deletes cleanly.
+resource "aws_iam_role_policy" "batch_service_ecs_teardown" {
+  count       = local.enable_batch ? 1 : 0
+  name_prefix = "ood-batch-ecs-teardown-"
+  role        = aws_iam_role.batch_service[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ecs:ListClusters",
+        "ecs:DescribeClusters",
+        "ecs:ListContainerInstances",
+        "ecs:DescribeContainerInstances",
+        "ecs:DeleteCluster",
+        "ecs:DeregisterContainerInstance",
+        "ecs:UpdateContainerInstancesState",
+      ]
+      Resource = "*"
+    }]
+  })
 }
 
 resource "aws_iam_role" "batch_job" {
@@ -3169,6 +3206,7 @@ resource "aws_s3_bucket" "flow_logs" {
   count         = var.enable_compliance_logging ? 1 : 0
   bucket_prefix = "ood-flow-logs-${var.environment}-"
   tags          = { Name = "ood-flow-logs-${var.environment}" }
+  force_destroy = !local.prod_protected # #79: clean non-prod teardown
 }
 
 resource "aws_s3_bucket_public_access_block" "flow_logs" {
@@ -3301,9 +3339,9 @@ resource "aws_s3_bucket" "cloudtrail" {
 
   tags = { Name = "ood-cloudtrail-${var.environment}" }
 
-  lifecycle {
-    prevent_destroy = true # M2: preserve compliance audit trail from accidental destroy
-  }
+  # #79: prod preserves the compliance audit trail (refuses delete of non-empty bucket);
+  # non-prod purges on destroy. Note compliance logging is typically only enabled in prod.
+  force_destroy = !local.prod_protected
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "cloudtrail" {
@@ -3341,6 +3379,7 @@ resource "aws_s3_bucket" "cloudtrail_logs" {
   count         = var.enable_compliance_logging ? 1 : 0
   bucket_prefix = "ood-cloudtrail-logs-${var.environment}-"
   tags          = { Name = "ood-cloudtrail-logs-${var.environment}" }
+  force_destroy = !local.prod_protected # #79: clean non-prod teardown
 }
 
 resource "aws_s3_bucket_public_access_block" "cloudtrail_logs" {
