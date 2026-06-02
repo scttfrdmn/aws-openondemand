@@ -184,6 +184,14 @@ export class OodStack extends cdk.Stack {
       this.node.tryGetContext("directoryUserFilter") || "(objectClass=person)";
     const directoryUsernameAttr: string =
       this.node.tryGetContext("directoryUsernameAttr") || "sAMAccountName";
+    // #78 PR C: per-user cross-account AssumeRole. Default off; mirrors the Terraform
+    // enable_per_user_roles / per_user_role_arn_template / per_user_role_external_id vars.
+    const enablePerUserRoles =
+      this.node.tryGetContext("enablePerUserRoles") === "true";
+    const perUserRoleArnTemplate: string =
+      this.node.tryGetContext("perUserRoleArnTemplate") || "";
+    const perUserRoleExternalId: string =
+      this.node.tryGetContext("perUserRoleExternalId") || "ood";
     const alarmEmail: string =
       this.node.tryGetContext("alarmEmail") || "";
     const adaptersEnabled: string[] =
@@ -525,6 +533,18 @@ export class OodStack extends cdk.Stack {
           });
         }
       }
+    }
+
+    // #78 PR C: let the instance role assume the per-user roles (adapters' AssumeRole).
+    // Scoped to the role-name pattern ({username} -> *); the per-user role's trust policy in
+    // the user's account is the authoritative gate. Mirrors aws_iam_role_policy.per_user_assume.
+    if (enablePerUserRoles && perUserRoleArnTemplate !== "") {
+      instanceRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["sts:AssumeRole"],
+          resources: [perUserRoleArnTemplate.replace("{username}", "*")],
+        })
+      );
     }
 
     // CloudWatch permissions — metrics to "*", log actions scoped to OOD log groups
@@ -976,6 +996,9 @@ export class OodStack extends cdk.Stack {
       `export OOD_LOG_GROUP_PREFIX="${logGroupPrefix}"`,
       `export OOD_ALB_DNS="${alb ? alb.loadBalancerDnsName : ""}"`, // #35
       `export OOD_USE_SSSD="${useSssd}"`, // #78: directory-backed POSIX identity
+      // #78 PR C: per-user AssumeRole ({username} expanded by the adapter at submit time).
+      `export OOD_PER_USER_ROLE_ARN="${enablePerUserRoles ? perUserRoleArnTemplate : ""}"`,
+      `export OOD_PER_USER_ROLE_EXTERNAL_ID="${enablePerUserRoles ? perUserRoleExternalId : ""}"`,
       // #49: export (not bare assign) so the fetched userdata.sh child process inherits it.
       `export ARTIFACT_BUCKET="${artifactBucket.bucketName}"`,
       // Fetch-verify-exec from S3. The SHA256 is computed at synth time from the

@@ -142,3 +142,20 @@ resource "aws_iam_role_policy" "directory_secrets_read" {
     }]
   })
 }
+
+# #78 PR C: let the OOD instance role assume the per-user roles (the adapters' AssumeRole).
+# Scoped to the role-name pattern; the per-user role's own trust policy (in the user's
+# account, requiring this instance role + the external id) is the authoritative gate.
+resource "aws_iam_role_policy" "per_user_assume" {
+  count       = var.enable_per_user_roles ? 1 : 0
+  name_prefix = "ood-per-user-assume-"
+  role        = aws_iam_role.ood.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["sts:AssumeRole"]
+      Resource = local.per_user_role_resource
+    }]
+  })
+}
