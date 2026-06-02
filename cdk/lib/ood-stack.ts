@@ -1,8 +1,6 @@
 import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as efs from "aws-cdk-lib/aws-efs";
-import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
-import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as autoscaling from "aws-cdk-lib/aws-autoscaling";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
@@ -24,7 +22,6 @@ import * as emrserverless from "aws-cdk-lib/aws-emrserverless";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
-import * as cr from "aws-cdk-lib/custom-resources";
 import * as directoryservice from "aws-cdk-lib/aws-directoryservice";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Construct } from "constructs";
@@ -96,7 +93,7 @@ export class OodStack extends cdk.Stack {
     const config = ENV_CONFIG[props.environment];
 
     // #79: deletion protection / RETAIN only in prod, so non-prod `cdk destroy` is one clean
-    // pass (mirrors the Terraform `prod_protected` local). Drives Cognito/DynamoDB protection,
+    // pass (mirrors the Terraform `prod_protected` local). Drives directory-secret protection,
     // RemovalPolicy, and S3 autoDeleteObjects below.
     const prodProtected = props.environment === "prod";
 
@@ -137,12 +134,8 @@ export class OodStack extends cdk.Stack {
 
     const domainName: string =
       this.node.tryGetContext("domainName") || "";
-    const useCognito =
-      this.node.tryGetContext("useCognito") !== "false";
     const enableEfs =
       this.node.tryGetContext("enableEfs") !== "false";
-    const enableDynamodbUid =
-      this.node.tryGetContext("enableDynamodbUid") !== "false";
     const enableSessionCache =
       this.node.tryGetContext("enableSessionCache") === "true";
     const enableS3Browser =
@@ -175,31 +168,32 @@ export class OodStack extends cdk.Stack {
       this.node.tryGetContext("enableDirectory") === "true";
     const directoryName: string =
       this.node.tryGetContext("directoryName") || "ood.internal";
+    // #78 PR B: configure SSSD/NSS + the Dex LDAP connector on the OOD host so authenticated
+    // users resolve via getpwnam against the directory (no login-time useradd). Pairs with
+    // enableDirectory, or point directoryLdapUri at an on-prem AD/LDAP. Mirrors the Terraform
+    // use_sssd / directory_* vars.
+    const useSssd =
+      this.node.tryGetContext("useSssd") === "true";
+    const directoryLdapUri: string =
+      this.node.tryGetContext("directoryLdapUri") || "";
+    const directoryBindDn: string =
+      this.node.tryGetContext("directoryBindDn") || "";
+    const directoryUserBaseDn: string =
+      this.node.tryGetContext("directoryUserBaseDn") || "";
+    const directoryUserFilter: string =
+      this.node.tryGetContext("directoryUserFilter") || "(objectClass=person)";
+    const directoryUsernameAttr: string =
+      this.node.tryGetContext("directoryUsernameAttr") || "sAMAccountName";
     const alarmEmail: string =
       this.node.tryGetContext("alarmEmail") || "";
     const adaptersEnabled: string[] =
       this.node.tryGetContext("adaptersEnabled") || [];
-    const oidcPamVersion: string =
-      this.node.tryGetContext("oidcPamVersion") || "v0.3.3";
-    if (!/^v[0-9]+\.[0-9]+\.[0-9]+/.test(oidcPamVersion)) {
-      throw new Error(`oidcPamVersion must be a semver tag like v0.3.3 (got "${oidcPamVersion}")`);
-    }
-    // H2: cognito_mfa_required=true sets MFA to REQUIRED (ON) instead of OPTIONAL.
-    // Set this in cdk.context.json for prod once all users have enrolled TOTP.
-    const cognitoMfaRequired =
-      this.node.tryGetContext("cognitoMfaRequired") === "true";
-    if (props.environment === "prod" && useCognito && !cognitoMfaRequired) {
-      throw new Error(
-        "Production Cognito deployments require cognitoMfaRequired=true. " +
-          "Set this in cdk.context.json after users complete TOTP enrollment."
-      );
-    }
     const logGroupPrefix = `/aws/ec2/ood-${props.environment}`;
 
     // Spot precondition
-    if (profile.useSpot && !(enableEfs && enableDynamodbUid && useCognito)) {
+    if (profile.useSpot && !enableEfs) {
       throw new Error(
-        'deploymentProfile="spot" requires enableEfs=true, enableDynamodbUid=true, and useCognito=true.'
+        'deploymentProfile="spot" requires enableEfs=true.'
       );
     }
 
@@ -267,14 +261,8 @@ export class OodStack extends cdk.Stack {
     sg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.udp(53), "DNS UDP");
     sg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(53), "DNS TCP");
 
-    // --- ALB (created early so its DNS name is the OIDC callback host AND the
-    // ood_portal servername in user_data; listeners + target group attach later). ---
-    // #25: a no-ALB, no-domain Cognito deploy has no stable HTTPS callback — fail fast.
-    if (useCognito && !enableAlb && domainName === "") {
-      throw new Error(
-        "Cognito browser auth requires a stable HTTPS callback URL — set enableAlb=true or provide domainName (an instance IP is not a viable OIDC redirect target)."
-      );
-    }
+    // --- ALB (created early so its DNS name is the ood_portal servername in user_data;
+    // listeners + target group attach later). ---
     // #33: an ALB requires >=2 AZ subnets; guard explicit single-subnet input.
     const albSubnetIds: string[] = this.node.tryGetContext("albSubnetIds") || [];
     if (enableAlb && albSubnetIds.length > 0 && new Set(albSubnetIds).size < 2) {
@@ -348,186 +336,6 @@ export class OodStack extends cdk.Stack {
           },
         })
       : ec2.MachineImage.latestAmazonLinux2023({ cpuType: profile.cpuArch });
-
-    // --- Cognito User Pool ---
-    let userPool: cognito.UserPool | undefined;
-    let appClient: cognito.UserPoolClient | undefined;
-    let oidcIssuer: string;
-    let oidcClientId: string;
-
-    if (useCognito) {
-      userPool = new cognito.UserPool(this, "UserPool", {
-        userPoolName: `ood-${props.environment}`,
-        selfSignUpEnabled: false,
-        signInAliases: { email: true },
-        autoVerify: { email: true },
-        passwordPolicy: {
-          minLength: 12,
-          requireLowercase: true,
-          requireUppercase: true,
-          requireDigits: true,
-          requireSymbols: true,
-        },
-        // H2: MFA driven by cognitoMfaRequired context — OPTIONAL during rollout,
-        // REQUIRED (ON) once all users have enrolled TOTP. Prod throws at synth time
-        // if cognitoMfaRequired is not set (enforced above).
-        mfa: cognitoMfaRequired ? cognito.Mfa.REQUIRED : cognito.Mfa.OPTIONAL,
-        mfaSecondFactor: { otp: true, sms: false },
-        accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
-        // #79: env-aware (mirrors the Terraform deletion_protection). prod RETAINs the pool
-        // and turns on native deletion protection; non-prod DESTROYs so `cdk destroy` is a
-        // clean one-pass teardown (was an unconditional RETAIN, which orphaned the pool).
-        deletionProtection: prodProtected,
-        removalPolicy: prodProtected
-          ? cdk.RemovalPolicy.RETAIN
-          : cdk.RemovalPolicy.DESTROY,
-      });
-
-      // #25: domain wins; else the ALB DNS (the precondition above guarantees one exists
-      // when use_cognito). No localhost fallback — it was never a reachable callback.
-      const callbackHost = domainName !== "" ? domainName : alb!.loadBalancerDnsName;
-      // #60: path is `/oidc`, NOT `/oidc/callback`. OOD's ood_portal.yml sets
-      // `oidc_uri: /oidc`, so mod_auth_openidc's OIDCRedirectURI (the redirect_uri sent to
-      // Cognito) is `/oidc`. The registered callback must match that exact path.
-      const callbackUrl = `https://${callbackHost}/oidc`;
-
-      appClient = new cognito.UserPoolClient(this, "AppClient", {
-        userPool,
-        userPoolClientName: `ood-portal-${props.environment}`,
-        generateSecret: true,
-        oAuth: {
-          flows: { authorizationCodeGrant: true },
-          scopes: [
-            cognito.OAuthScope.OPENID,
-            cognito.OAuthScope.EMAIL,
-            cognito.OAuthScope.PROFILE,
-          ],
-          callbackUrls: [callbackUrl],
-          logoutUrls: [`https://${callbackHost}`],
-        },
-        // M8: Both userPassword and userSrp are intentionally disabled.
-        // OOD uses OIDC/OAuth2 via the ALB authenticator — users never authenticate
-        // directly against Cognito's native auth endpoints. Disabling these flows
-        // prevents credential stuffing attacks against the Cognito hosted UI endpoints.
-        authFlows: { userPassword: false, userSrp: false },
-        preventUserExistenceErrors: true,
-      });
-
-      oidcIssuer = `https://cognito-idp.${this.region}.amazonaws.com/${userPool.userPoolId}`;
-      oidcClientId = appClient.userPoolClientId;
-
-      // Store OIDC config in SSM for userdata.sh
-      if (enableParameterStore) {
-        new ssm.StringParameter(this, "SsmOidcIssuer", {
-          parameterName: `/ood/${props.environment}/oidc_issuer_url`,
-          stringValue: oidcIssuer,
-        });
-        new ssm.StringParameter(this, "SsmOidcClientId", {
-          parameterName: `/ood/${props.environment}/oidc_client_id`,
-          stringValue: oidcClientId,
-        });
-
-        // #37: oidc-auth-broker v0.3.x requires security.token_encryption_key (32 raw
-        // bytes, base64-encoded — what `openssl rand -base64 32` yields). userdata.sh
-        // reads /ood/${env}/broker_token_key (SecureString, --with-decryption) into
-        // OOD_BROKER_TOKEN_KEY → broker.yaml. Mirrors aws_ssm_parameter.broker_token_key
-        // in terraform/main.tf, gated on use_cognito && enable_parameter_store.
-        //
-        // CloudFormation's native AWS::SSM::Parameter cannot create a SecureString, so we
-        // PutParameter via a custom resource. DIVERGENCE from Terraform: TF holds the
-        // random value in state and keeps it stable across applies; CDK has no such store,
-        // so the key is re-generated whenever the template is re-synthesized and will
-        // rotate on redeploy. For a token-encryption key this is benign — it only forces
-        // the broker to re-issue session tokens (users re-authenticate), it does not break
-        // the deployment.
-        const brokerTokenKey = crypto.randomBytes(32).toString("base64");
-        const brokerKeyParamName = `/ood/${props.environment}/broker_token_key`;
-        new cr.AwsCustomResource(this, "BrokerTokenKeyParam", {
-          // Stable physical id keyed on the parameter name — the resource maps 1:1 to the
-          // SSM parameter regardless of value churn.
-          resourceType: "Custom::SsmSecureString",
-          onCreate: {
-            service: "SSM",
-            action: "putParameter",
-            parameters: {
-              Name: brokerKeyParamName,
-              Value: brokerTokenKey,
-              Type: "SecureString",
-              Overwrite: true,
-              ...(cmk ? { KeyId: cmk.keyArn } : {}),
-            },
-            physicalResourceId: cr.PhysicalResourceId.of(brokerKeyParamName),
-          },
-          onUpdate: {
-            service: "SSM",
-            action: "putParameter",
-            parameters: {
-              Name: brokerKeyParamName,
-              Value: brokerTokenKey,
-              Type: "SecureString",
-              Overwrite: true,
-              ...(cmk ? { KeyId: cmk.keyArn } : {}),
-            },
-            physicalResourceId: cr.PhysicalResourceId.of(brokerKeyParamName),
-          },
-          onDelete: {
-            service: "SSM",
-            action: "deleteParameter",
-            parameters: { Name: brokerKeyParamName },
-          },
-          policy: cr.AwsCustomResourcePolicy.fromStatements([
-            new iam.PolicyStatement({
-              actions: ["ssm:PutParameter", "ssm:DeleteParameter"],
-              resources: [
-                `arn:aws:ssm:${this.region}:${this.account}:parameter${brokerKeyParamName}`,
-              ],
-            }),
-            // KMS Encrypt is required for SecureString PutParameter under a CMK.
-            ...(cmk
-              ? [
-                  new iam.PolicyStatement({
-                    actions: ["kms:Encrypt", "kms:GenerateDataKey"],
-                    resources: [cmk.keyArn],
-                  }),
-                ]
-              : []),
-          ]),
-          installLatestAwsSdk: false,
-        });
-      }
-    }
-
-    // --- DynamoDB UID mapping ---
-    let uidTable: dynamodb.Table | undefined;
-    if (enableDynamodbUid) {
-      uidTable = new dynamodb.Table(this, "UidMap", {
-        tableName: `oid-uid-map-${props.environment}`,
-        // #39: keyed on `username` (the only identity the pam_exec provisioning hook
-        // receives). Rows are {username, uid}; a "__uid_counter__" sentinel item holds
-        // next_uid for atomic allocation. (Re-key forces table replacement on an existing
-        // deployment — the table is empty in practice at first wiring.)
-        partitionKey: { name: "username", type: dynamodb.AttributeType.STRING },
-        billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-        pointInTimeRecovery: true,
-        encryption: enableKmsCmk
-          ? dynamodb.TableEncryption.CUSTOMER_MANAGED
-          : dynamodb.TableEncryption.AWS_MANAGED,
-        encryptionKey: cmk,
-        // #79: native deletion protection + RETAIN in prod only; non-prod DESTROYs for a
-        // clean `cdk destroy` (mirrors the Terraform deletion_protection_enabled).
-        deletionProtection: prodProtected,
-        removalPolicy: prodProtected
-          ? cdk.RemovalPolicy.RETAIN
-          : cdk.RemovalPolicy.DESTROY,
-      });
-
-      if (enableParameterStore) {
-        new ssm.StringParameter(this, "SsmUidTable", {
-          parameterName: `/ood/${props.environment}/dynamodb_uid_table`,
-          stringValue: uidTable.tableName,
-        });
-      }
-    }
 
     // --- EFS /home ---
     let homeFs: efs.FileSystem | undefined;
@@ -675,6 +483,50 @@ export class OodStack extends cdk.Stack {
       dirAdminSecret.grantRead(instanceRole);
     }
 
+    // --- #78 PR B: SSSD/NSS + Dex LDAP connector coordinates ---
+    // Mirrors the use_sssd-gated resources in terraform/directory.tf. The Dex LDAP connector
+    // binds to the directory with this password; in eval mode (enableDirectory) the operator
+    // can leave it for the directory admin secret, so we create the empty-generated secret and
+    // publish the directory coordinates the OOD host reads at boot to configure SSSD + Dex.
+    if (useSssd) {
+      const dirBindSecret = new secretsmanager.Secret(this, "DirectoryBindSecret", {
+        secretName: `ood/${props.environment}/directory-bind-password`,
+        description: "#78: LDAP bind password for the Dex connector",
+        encryptionKey: cmk,
+        generateSecretString: {
+          passwordLength: 32,
+          excludeCharacters: ' "\'\\/@',
+        },
+        removalPolicy: prodProtected
+          ? cdk.RemovalPolicy.RETAIN
+          : cdk.RemovalPolicy.DESTROY,
+      });
+      dirBindSecret.grantRead(instanceRole);
+
+      if (enableParameterStore) {
+        // directory_ldap_uri prefers the explicit override, else the provisioned endpoint
+        // (the OOD host falls back to the directory_dns_ips param when this is empty).
+        new ssm.StringParameter(this, "SsmDirectoryLdapUri", {
+          parameterName: `/ood/${props.environment}/directory_ldap_uri`,
+          // SSM rejects empty String values; emit a single space for unset
+          // (the boot script treats it as unset). Mirrors the TF " " fallback.
+          stringValue: directoryLdapUri !== "" ? directoryLdapUri : " ",
+        });
+        const dirCoords: Record<string, string> = {
+          directory_bind_dn: directoryBindDn,
+          directory_user_base_dn: directoryUserBaseDn,
+          directory_user_filter: directoryUserFilter,
+          directory_username_attr: directoryUsernameAttr,
+        };
+        for (const [key, value] of Object.entries(dirCoords)) {
+          new ssm.StringParameter(this, `SsmDir-${key}`, {
+            parameterName: `/ood/${props.environment}/${key}`,
+            stringValue: value !== "" ? value : " ",
+          });
+        }
+      }
+    }
+
     // CloudWatch permissions — metrics to "*", log actions scoped to OOD log groups
     instanceRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
@@ -713,24 +565,6 @@ export class OodStack extends cdk.Stack {
             `arn:aws:ssm:${this.region}:${this.account}:parameter/ood/${props.environment}`,
             `arn:aws:ssm:${this.region}:${this.account}:parameter/ood/${props.environment}/*`,
           ],
-        })
-      );
-    }
-
-    // DynamoDB UID table access (explicit — no Scan, no DeleteItem: H1)
-    if (enableDynamodbUid && uidTable) {
-      instanceRole.addToPrincipalPolicy(
-        new iam.PolicyStatement({
-          actions: [
-            "dynamodb:GetItem",
-            "dynamodb:PutItem",
-            "dynamodb:UpdateItem",
-            "dynamodb:Query",
-            // DeleteItem intentionally omitted: UID mappings must not be deletable
-            // by the portal instance to prevent identity erasure. Use the console
-            // or a separate admin role for deprovisioning.
-          ],
-          resources: [uidTable.tableArn],
         })
       );
     }
@@ -1106,10 +940,7 @@ export class OodStack extends cdk.Stack {
     });
 
     // Upload the bootstrap scripts (CDK-native equivalent of aws_s3_object).
-    // ood-provision-user.sh is included only when the UID map is enabled (#39), matching
-    // the count-gated aws_s3_object.provision_user in Terraform.
     const scriptIncludes = ["**", "!userdata.sh", "!bake.sh"];
-    if (enableDynamodbUid) scriptIncludes.push("!ood-provision-user.sh");
     new s3deploy.BucketDeployment(this, "ArtifactDeployment", {
       destinationBucket: artifactBucket,
       sources: [
@@ -1144,9 +975,7 @@ export class OodStack extends cdk.Stack {
       `export OOD_ADAPTERS_ENABLED='${JSON.stringify(adaptersEnabled)}'`,
       `export OOD_LOG_GROUP_PREFIX="${logGroupPrefix}"`,
       `export OOD_ALB_DNS="${alb ? alb.loadBalancerDnsName : ""}"`, // #35
-      `export OOD_OIDC_PAM_VERSION="${oidcPamVersion}"`,
-      `export OOD_DYNAMODB_UID_TABLE="${uidTable ? uidTable.tableName : ""}"`,
-      `export OOD_USE_SSSD="${this.node.tryGetContext("useSssd") === "true"}"`, // #78: directory-backed POSIX identity
+      `export OOD_USE_SSSD="${useSssd}"`, // #78: directory-backed POSIX identity
       // #49: export (not bare assign) so the fetched userdata.sh child process inherits it.
       `export ARTIFACT_BUCKET="${artifactBucket.bucketName}"`,
       // Fetch-verify-exec from S3. The SHA256 is computed at synth time from the
@@ -1758,20 +1587,6 @@ export class OodStack extends cdk.Stack {
       description: "Connect via SSM Session Manager",
       value: `aws ec2 describe-instances --filters 'Name=tag:aws:autoscaling:groupName,Values=${asg.autoScalingGroupName}' 'Name=instance-state-name,Values=running' --query 'Reservations[0].Instances[0].InstanceId' --output text | xargs -I{} aws ssm start-session --target {}`,
     });
-
-    if (userPool) {
-      new cdk.CfnOutput(this, "CognitoUserPoolId", {
-        value: userPool.userPoolId,
-        description: "Cognito User Pool ID",
-      });
-    }
-
-    if (uidTable) {
-      new cdk.CfnOutput(this, "UidTableName", {
-        value: uidTable.tableName,
-        description: "DynamoDB UID mapping table",
-      });
-    }
 
     if (homeFs) {
       new cdk.CfnOutput(this, "EfsId", {

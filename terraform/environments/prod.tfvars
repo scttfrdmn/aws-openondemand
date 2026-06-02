@@ -23,8 +23,6 @@ instance_type      = "m6i.2xlarge" # Override for 200+ users
 # --- Cloud-native progression (all levels) ---
 enable_efs                   = true  # Level 1: /home on EFS
 enable_efs_one_zone          = false # Multi-AZ
-enable_dynamodb_uid          = true  # Level 2: replaces LDAP
-use_cognito                  = true  # Level 3: institutional SSO
 enable_session_cache         = true  # Level 5: PUN sessions survive instance replacement
 enable_s3_browser            = true  # Level 6: researchers browse S3 from OOD
 enable_cloudwatch_accounting = true  # Level 7: per-user/project dollar-denominated accounting
@@ -47,9 +45,6 @@ enable_kms_cmk             = true # Customer-managed keys for all encrypted reso
 # --- Compute backends ---
 adapters_enabled = ["batch", "sagemaker", "parallelcluster"]
 # Add "onprem" to the list and set onprem_* vars to connect campus cluster
-
-# --- Identity ---
-# cognito_saml_metadata_url = "https://idp.university.edu/metadata"
 
 # --- On-prem (uncomment to enable) ---
 # onprem_vpn_cidr   = "10.100.0.0/16"

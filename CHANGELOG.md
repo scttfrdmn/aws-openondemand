@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Identity pivot — Dex + SSSD replaces the bespoke Cognito/oidc-pam/DynamoDB stack (#78,
+  closes #77).** Web auth is now OOD's bundled **Dex** with an **LDAP connector** bound to a
+  directory; POSIX identity is **SSSD/NSS** against the *same* directory with
+  `oddjob-mkhomedir` — so `getpwnam` resolves directory-side and the OIDC username == the Unix
+  account by construction. This eliminates the login-time-`useradd` path that #77 proved
+  impossible on OOD 4.x (`nginx_stage` resolves the user before any hook). Two modes: eval
+  (in-account Simple AD via `enable_directory`) and production (bring-your-own directory via
+  `directory_ldap_uri`). `ood-portal-generator` owns the Apache vhost from the `dex:` block, so
+  the #52/#60/#73 hand-wiring class cannot recur. **Removed** (TF + CDK): the Cognito user
+  pool/client/domain/SAML IdP, the DynamoDB UID map, the oidc-pam/oidc-auth-broker install +
+  `broker_token_key` + OIDC client-secret/SSM/rotation resources, `scripts/ood-provision-user.sh`,
+  and the `use_cognito`/`cognito_*`/`enable_dynamodb_uid`/`oidc_*`/`oidc_pam_version` variables.
+  Added the Dex LDAP bind contract (`directory_bind_dn`/`directory_user_base_dn`/
+  `directory_user_filter`/`directory_username_attr` + a `directory-bind-password` Secrets
+  Manager secret). Implements the design in `docs/reference-architecture.md`; `identity-guide.md`
+  rewritten to the new model.
+
 ### Added
 - `docs/reference-architecture.md`: the prescriptive best-practice design for OOD on AWS (#78).
   Defines the identity model (OOD defers web auth to an OIDC IdP via Dex and POSIX identity to a
