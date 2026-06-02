@@ -25,6 +25,8 @@ import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as cr from "aws-cdk-lib/custom-resources";
+import * as directoryservice from "aws-cdk-lib/aws-directoryservice";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Construct } from "constructs";
 import * as crypto from "crypto";
 import * as fs from "fs";
@@ -167,6 +169,12 @@ export class OodStack extends cdk.Stack {
       this.node.tryGetContext("enablePackerAmi") !== "false";
     const enableParameterStore =
       this.node.tryGetContext("enableParameterStore") !== "false";
+    // #78: directory-backed identity (AWS Directory Service + SSSD). Default off; mirrors the
+    // Terraform enable_directory / directory_name / directory_ldap_uri vars.
+    const enableDirectory =
+      this.node.tryGetContext("enableDirectory") === "true";
+    const directoryName: string =
+      this.node.tryGetContext("directoryName") || "ood.internal";
     const alarmEmail: string =
       this.node.tryGetContext("alarmEmail") || "";
     const adaptersEnabled: string[] =
@@ -607,6 +615,65 @@ export class OodStack extends cdk.Stack {
         ),
       ],
     });
+
+    // --- #78: AWS Directory Service — POSIX identity source for SSSD/NSS ---
+    // Mirrors terraform/directory.tf. Managed directory (no servers/DB): Simple AD non-prod,
+    // Managed Microsoft AD prod. The OOD host resolves users via SSSD/getpwnam against it, so
+    // no login-time useradd is needed (the #77 fix). Default off until the cutover. Placed
+    // after instanceRole so the admin secret can be granted to it.
+    if (enableDirectory) {
+      // >=2 subnets in different AZs are required (same constraint as the ALB).
+      if (new Set(vpc.privateSubnets.map((s) => s.subnetId)).size < 2) {
+        throw new Error(
+          "enableDirectory requires at least 2 private subnets in different AZs (AWS Directory Service is multi-AZ)."
+        );
+      }
+      const dirSubnetIds = vpc.privateSubnets.slice(0, 2).map((s) => s.subnetId);
+
+      // Admin password (used only for the SSSD domain join) in Secrets Manager — fetched at
+      // boot, never written to user_data. RETAIN in prod; DESTROY non-prod for clean teardown (#79).
+      const dirAdminSecret = new secretsmanager.Secret(this, "DirectoryAdminSecret", {
+        secretName: `ood/${props.environment}/directory-admin-password`,
+        description: "#78: AWS Directory Service admin password (SSSD domain join)",
+        encryptionKey: cmk,
+        generateSecretString: {
+          passwordLength: 32,
+          excludeCharacters: ' "\'\\/@',
+        },
+        removalPolicy: prodProtected
+          ? cdk.RemovalPolicy.RETAIN
+          : cdk.RemovalPolicy.DESTROY,
+      });
+
+      const dirProps = {
+        name: directoryName,
+        password: dirAdminSecret.secretValue.unsafeUnwrap(),
+        vpcSettings: { vpcId: vpc.vpcId, subnetIds: dirSubnetIds },
+      };
+      const directory = prodProtected
+        ? new directoryservice.CfnMicrosoftAD(this, "Directory", {
+            ...dirProps,
+            edition: "Standard",
+          })
+        : new directoryservice.CfnSimpleAD(this, "Directory", {
+            ...dirProps,
+            size: "Small",
+          });
+
+      if (enableParameterStore) {
+        new ssm.StringParameter(this, "SsmDirectoryName", {
+          parameterName: `/ood/${props.environment}/directory_name`,
+          stringValue: directoryName,
+        });
+        new ssm.StringParameter(this, "SsmDirectoryDnsIps", {
+          parameterName: `/ood/${props.environment}/directory_dns_ips`,
+          stringValue: cdk.Fn.join(",", directory.attrDnsIpAddresses),
+        });
+      }
+
+      // The OOD instance role reads the admin password to perform the SSSD domain join.
+      dirAdminSecret.grantRead(instanceRole);
+    }
 
     // CloudWatch permissions — metrics to "*", log actions scoped to OOD log groups
     instanceRole.addToPrincipalPolicy(
@@ -1079,6 +1146,7 @@ export class OodStack extends cdk.Stack {
       `export OOD_ALB_DNS="${alb ? alb.loadBalancerDnsName : ""}"`, // #35
       `export OOD_OIDC_PAM_VERSION="${oidcPamVersion}"`,
       `export OOD_DYNAMODB_UID_TABLE="${uidTable ? uidTable.tableName : ""}"`,
+      `export OOD_USE_SSSD="${this.node.tryGetContext("useSssd") === "true"}"`, // #78: directory-backed POSIX identity
       // #49: export (not bare assign) so the fetched userdata.sh child process inherits it.
       `export ARTIFACT_BUCKET="${artifactBucket.bucketName}"`,
       // Fetch-verify-exec from S3. The SHA256 is computed at synth time from the

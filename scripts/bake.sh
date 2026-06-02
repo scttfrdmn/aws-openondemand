@@ -16,6 +16,14 @@ dnf -y install --allowerasing vim wget curl unzip git tar \
   policycoreutils-python-utils cronie logrotate jq fail2ban \
   amazon-cloudwatch-agent amazon-efs-utils python3-botocore
 
+# #78: SSSD/NSS directory-identity stack (AWS Directory Service join). Baked in unconditionally
+# (harmless when use_sssd=false); userdata.sh writes /etc/sssd/sssd.conf + joins at launch.
+# sssd-ad: AD provider; realmd/adcli: domain join; oddjob-mkhomedir: create homes on first
+# login (replaces the bespoke ood-provision-user/useradd path that #77 proved can't work);
+# authselect: enable the sssd profile.
+dnf -y install sssd sssd-ad sssd-ldap sssd-tools realmd adcli \
+  oddjob oddjob-mkhomedir authselect krb5-workstation samba-common-tools
+
 ###############################################################################
 # 1a. fail2ban — nginx jails (SSH is not exposed; SSM only)
 ###############################################################################

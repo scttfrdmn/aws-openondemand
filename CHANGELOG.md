@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Directory-backed identity foundation (#78, Phase 1 — additive, default off). Introduces the
+  OOD-native replacement for the bespoke login-time-`useradd` stack that #77 proved
+  architecturally impossible (nginx_stage's `getpwnam` runs before any provisioning hook). New
+  `enable_directory` provisions **AWS Directory Service** (Simple AD non-prod / Managed
+  Microsoft AD prod — managed, no servers/DB) in both TF (`terraform/directory.tf`) and CDK,
+  with the admin password in Secrets Manager. New `use_sssd` configures **SSSD/NSS +
+  oddjob-mkhomedir** on the OOD host (`bake.sh` installs the stack; `userdata.sh` joins the
+  realm and enables the sssd profile), so authenticated users resolve via `getpwnam`
+  directory-side and homes are created on first login — **no account creation at request
+  time**. `directory_ldap_uri` keeps the directory host swappable (managed AD ↔ on-prem
+  AD/LDAP) with no code change. Both toggles default **off**; the existing Cognito/oidc-pam
+  path is unchanged until the cutover. Web auth stays Cognito (OIDC). Closes the design half
+  of #78; the live new-user→dashboard validation and the Cognito↔AD federation are fast-follows.
+
 ### Fixed
 - `terraform destroy` (and `cdk destroy`) of a non-prod env is now one clean pass (#79). Three
   fixes, both IaC paths:
