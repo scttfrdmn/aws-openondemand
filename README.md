@@ -499,7 +499,7 @@ bash scripts/teardown-terraform-backend.sh
 * [Deployment Guide](docs/deployment-guide.md) — profiles, toggles, environments explained
 * [Adapter Guide](docs/adapter-guide.md) — configuring each compute backend
 * [Identity Guide](docs/identity-guide.md) — OIDC provider setup, oidc-pam config, UID mapping
-* [Architecture](docs/architecture.md) — diagrams and design decisions
+* [Reference Architecture](docs/reference-architecture.md) — the prescriptive best-practice design (identity, account model, the two deployment modes)
 * [Cost Guide](docs/cost-guide.md) — toggle-by-toggle cost breakdown, example configurations
 * [Troubleshooting](docs/troubleshooting.md) — common mistakes, WAF debugging, bootstrap monitoring
 

@@ -1,6 +1,13 @@
 # Identity Guide
 
-This guide covers OIDC provider setup and `oidc-pam` configuration for aws-openondemand.
+This guide covers OIDC provider setup and identity configuration for aws-openondemand.
+
+> **Designing a deployment?** Read [reference-architecture.md](reference-architecture.md)
+> first — it explains the prescribed identity model (OOD defers auth to an OIDC IdP via Dex
+> and POSIX identity to a directory via SSSD; bring your own directory in production, or use
+> the in-account Simple AD eval mode) and why. This guide is the operator how-to; the
+> reference architecture is the design intent. The Cognito/`oidc-pam` material below is the
+> legacy path being retired (see the reference's Migration & cutover section).
 
 ## Overview
 

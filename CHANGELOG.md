@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `docs/reference-architecture.md`: the prescriptive best-practice design for OOD on AWS (#78).
+  Defines the identity model (OOD defers web auth to an OIDC IdP via Dex and POSIX identity to a
+  directory via SSSD — same directory, so the OIDC username == the POSIX account), the two
+  deployment modes (in-account Simple AD for eval vs bring-your-own directory for production),
+  the multi-account model (identity / portal / per-user compute) with per-user cross-account
+  AssumeRole, the BYO-directory config contract, and the rejected alternatives (Keycloak / IAM
+  Identity Center / Cognito-federation — all leave POSIX identity unsolved). Repoints the
+  README "Architecture" link (previously dangling) and reframes identity-guide.md around it.
+  This is the design every subsequent identity PR implements against; it retires the bespoke
+  Cognito/oidc-pam/DynamoDB-UID/login-useradd stack the #39→#77 chain proved unworkable.
 - Directory-backed identity foundation (#78, Phase 1 — additive, default off). Introduces the
   OOD-native replacement for the bespoke login-time-`useradd` stack that #77 proved
   architecturally impossible (nginx_stage's `getpwnam` runs before any provisioning hook). New
