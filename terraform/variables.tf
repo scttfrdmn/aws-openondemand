@@ -328,3 +328,38 @@ variable "directory_username_attr" {
   default     = "sAMAccountName"
   description = "#78: AD/LDAP attribute Dex uses as the OOD username. sAMAccountName (AD) yields a bare name (demo) that matches the POSIX account SSSD resolves — NOT userPrincipalName/email (which would mismatch)."
 }
+
+# ---------------------------------------------------------------------------
+# #78 PR C: per-user cross-account AWS identity.
+# In the multi-account topology, an adapter's AWS calls should run in the LOGGING-IN USER's
+# own account under a per-user role, not the OOD instance role. When enabled, the portal's
+# cluster YAML passes --assume-role-arn (with a {username} placeholder the adapter expands
+# from the runtime user) to each adapter, and the instance role is granted sts:AssumeRole on
+# the role pattern. Default OFF: the instance role is used directly (single-account on-ramp).
+# The per-user roles themselves live in the user's account and are the operator's to create
+# (with a trust policy allowing the OOD instance role + the external id) — see
+# docs/reference-architecture.md §4.
+# ---------------------------------------------------------------------------
+
+variable "enable_per_user_roles" {
+  type        = bool
+  default     = false
+  description = "#78: adapters assume a per-user role in the user's AWS account (via --assume-role-arn) instead of using the OOD instance role. Requires per_user_role_arn_template. Default off (single-account uses the instance role)."
+}
+
+variable "per_user_role_arn_template" {
+  type        = string
+  default     = ""
+  description = "#78: role ARN the adapters assume, with a literal {username} placeholder the adapter expands from the logged-in user, e.g. arn:aws:iam::ACCOUNT:role/ood-user-{username}. Required when enable_per_user_roles=true."
+
+  validation {
+    condition     = var.per_user_role_arn_template == "" || can(regex("\\{username\\}", var.per_user_role_arn_template))
+    error_message = "per_user_role_arn_template should contain a {username} placeholder so each user assumes their own role (e.g. arn:aws:iam::ACCOUNT:role/ood-user-{username})."
+  }
+}
+
+variable "per_user_role_external_id" {
+  type        = string
+  default     = "ood"
+  description = "#78: sts:ExternalId the adapters present when assuming the per-user role (the user-account role's trust policy should require this)."
+}

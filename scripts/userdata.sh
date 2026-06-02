@@ -287,6 +287,20 @@ fi
 ###############################################################################
 ADAPTERS_JSON="${OOD_ADAPTERS_ENABLED}"
 
+# #78 PR C: when per-user roles are enabled, every adapter gets --assume-role-arn (with the
+# {username} placeholder the adapter expands from the logged-in user at submit time) +
+# --assume-role-external-id. Built once and injected into each cluster YAML's args list below.
+# Empty (default) = no extra args, adapters use the OOD instance role (single-account).
+OOD_PER_USER_ROLE_ARN="${OOD_PER_USER_ROLE_ARN:-}"
+OOD_PER_USER_ROLE_EXTERNAL_ID="${OOD_PER_USER_ROLE_EXTERNAL_ID:-}"
+ASSUME_ROLE_ARGS=""
+if [ -n "${OOD_PER_USER_ROLE_ARN}" ]; then
+  # Two YAML sequence items at the adapter args indentation (8 spaces). The adapter expands
+  # {username} from $USER, so OOD's per-user PUN passes its own identity automatically.
+  printf -v ASSUME_ROLE_ARGS '\n        - "--assume-role-arn=%s"\n        - "--assume-role-external-id=%s"' \
+    "${OOD_PER_USER_ROLE_ARN}" "${OOD_PER_USER_ROLE_EXTERNAL_ID}"
+fi
+
 # Batch adapter cluster config
 if echo "${ADAPTERS_JSON}" | python3 -c "import sys,json; print('batch' in json.load(sys.stdin))" 2>/dev/null | grep -q True; then
   echo "=== Configuring Batch cluster ==="
@@ -312,6 +326,7 @@ v2:
         - submit
         - "--queue=${BATCH_QUEUE}"
         - "--region=${AWS_REGION}"
+${ASSUME_ROLE_ARGS}
 BATCHCONF
 fi
 
@@ -338,6 +353,7 @@ v2:
         - launch
         - "--domain-id=${SM_DOMAIN_ID}"
         - "--region=${AWS_REGION}"
+${ASSUME_ROLE_ARGS}
 SMCONF
 fi
 
@@ -378,6 +394,7 @@ v2:
       args:
         - submit
         - "--region=${AWS_REGION}"
+${ASSUME_ROLE_ARGS}
 OMICSCONF
 fi
 
@@ -398,6 +415,7 @@ v2:
       args:
         - submit
         - "--region=${AWS_REGION}"
+${ASSUME_ROLE_ARGS}
 BEDROCKCONF
 fi
 
@@ -425,6 +443,7 @@ v2:
         - submit
         - "--application-id=${EMR_APP_ID}"
         - "--region=${AWS_REGION}"
+${ASSUME_ROLE_ARGS}
 EMRCONF
 fi
 
@@ -445,6 +464,7 @@ v2:
       args:
         - submit
         - "--region=${AWS_REGION}"
+${ASSUME_ROLE_ARGS}
 SMTRAINCONF
 fi
 
@@ -477,6 +497,7 @@ v2:
         - submit
         - "--cluster=${ECS_CLUSTER_ARN}"
         - "--region=${AWS_REGION}"
+${ASSUME_ROLE_ARGS}
 FARGATECONF
 fi
 
@@ -497,6 +518,7 @@ v2:
       args:
         - submit
         - "--region=${AWS_REGION}"
+${ASSUME_ROLE_ARGS}
 SFNCONF
 fi
 
@@ -517,6 +539,7 @@ v2:
       args:
         - submit
         - "--region=${AWS_REGION}"
+${ASSUME_ROLE_ARGS}
 BRAKETCONF
 fi
 

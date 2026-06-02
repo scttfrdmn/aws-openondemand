@@ -150,10 +150,38 @@ evaluation and small sites.
 | **Per-user compute account(s)** | the user's AWS compute (Batch/SageMaker/EC2/…) | Adapter jobs run here via per-user cross-account `AssumeRole` keyed on the OIDC identity — **not** the OOD instance role. |
 
 **Credential flow (compute identity).** The portal vends **short-lived, per-user STS
-credentials** into the adapter at submit time by assuming a role in the *user's* account
-(web-identity / cross-account `AssumeRole` keyed on the OIDC `sub`/email, with an `externalId`).
+credentials** into the adapter at submit time by assuming a role in the *user's* account.
 The portal holds no standing credentials for user accounts. (This is roadmap #10, the "STS
 credential injector," which this architecture makes **core**, not optional.)
+
+**How it's wired (implemented, default-off).** Enable with `enable_per_user_roles=true` +
+`per_user_role_arn_template` (a role ARN containing a literal `{username}` placeholder, e.g.
+`arn:aws:iam::USER_ACCOUNT:role/ood-user-{username}`). The portal then passes
+`--assume-role-arn`/`--assume-role-external-id` to every backend adapter via its `clusters.d`
+config; the adapter — which OOD runs **as the logged-in user** — expands `{username}` from its
+runtime identity and assumes that user's role via STS (caching the creds). The OOD instance
+role is granted `sts:AssumeRole` only on the `…/ood-user-*` pattern. Default off ⇒ adapters use
+the instance role directly (single-account on-ramp).
+
+**The per-user role lives in the user's account** and is the operator's to create — OOD only
+assumes it. Each such role needs (a) the service permissions for the backends the user may use
+(Batch/SageMaker/EC2/…), and (b) a trust policy allowing the OOD portal's instance role to
+assume it, gated by the external id:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::OOD_PORTAL_ACCOUNT:role/<ood-instance-role>" },
+    "Action": "sts:AssumeRole",
+    "Condition": { "StringEquals": { "sts:ExternalId": "ood" } }
+  }]
+}
+```
+
+The role name must match the template (`ood-user-<username>`, where `<username>` is the
+directory/POSIX username), so the adapter's expansion lands on the right role.
 
 **Single-account on-ramp.** For eval/small deployments, everything collapses into one account:
 the eval Simple AD, the portal, and compute share the account, and adapters use the OOD instance
@@ -226,7 +254,7 @@ The legacy stack violated this line by making the portal the account authority (
 | BYO-directory contract | `directory_ldap_uri` / `directory_name` / `directory_ldap_schema` + bind secret |
 | SSSD / NSS / oddjob-mkhomedir | `scripts/bake.sh` (packages) + `scripts/userdata.sh` (`use_sssd` block: realm join, authselect) |
 | Dex web auth | `ood_portal.yml` `dex:` block in `scripts/userdata.sh` (generator-owned vhost) — *PR B* |
-| Per-user compute AssumeRole | adapter IAM rework — *later phase (roadmap #10)* |
+| Per-user compute AssumeRole | adapter `--assume-role-arn` ({username}-templated) + `enable_per_user_roles`/`per_user_role_arn_template` (TF+CDK, default off) — see §4 |
 | Operator how-to | [identity-guide.md](identity-guide.md) |
 
 ---
