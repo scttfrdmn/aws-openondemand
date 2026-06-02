@@ -92,9 +92,10 @@ locals {
     var.enable_directory ? "ldaps://${var.directory_name}" : ""
   )
 
-  # Precondition: spot profile requires cloud-native stack
+  # Precondition: spot profile requires the stateless-instance prerequisite (EFS-backed /home),
+  # so a Spot interruption that replaces the instance does not lose user data.
   # (enforced below via lifecycle precondition on the ASG)
-  spot_prereqs_met = !local.use_spot || (var.enable_efs && var.enable_dynamodb_uid && var.use_cognito)
+  spot_prereqs_met = !local.use_spot || var.enable_efs
 }
 
 # ---------------------------------------------------------------------------
@@ -456,41 +457,6 @@ resource "aws_iam_role_policy" "artifacts_read" {
   })
 }
 
-# Secrets Manager: fetch OIDC client secret at runtime (H2)
-resource "aws_iam_role_policy" "secrets_manager" {
-  count       = var.use_cognito ? 1 : 0
-  name_prefix = "ood-secrets-manager-"
-  role        = aws_iam_role.ood.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["secretsmanager:GetSecretValue"]
-      Resource = aws_secretsmanager_secret.oidc_client_secret[0].arn
-    }]
-  })
-}
-
-# DynamoDB UID mapping table access
-resource "aws_iam_role_policy" "dynamodb_uid" {
-  count       = var.enable_dynamodb_uid ? 1 : 0
-  name_prefix = "ood-dynamodb-uid-"
-  role        = aws_iam_role.ood.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "dynamodb:GetItem",
-        "dynamodb:PutItem",
-        "dynamodb:UpdateItem",
-        "dynamodb:Query",
-      ]
-      Resource = aws_dynamodb_table.uid_map[0].arn
-    }]
-  })
-}
-
 # EFS mount access (ClientMount + DescribeMountTargets for IAM auth DNS fallback)
 resource "aws_iam_role_policy" "efs" {
   count       = var.enable_efs ? 1 : 0
@@ -669,173 +635,6 @@ resource "aws_iam_role_policy" "ec2_adapter" {
 }
 
 # ---------------------------------------------------------------------------
-# Cognito — User Pool + App Client
-# ---------------------------------------------------------------------------
-resource "aws_cognito_user_pool" "ood" {
-  count = var.use_cognito ? 1 : 0
-  name  = "ood-${var.environment}"
-
-  username_attributes      = ["email"]
-  auto_verified_attributes = ["email"]
-
-  password_policy {
-    minimum_length                   = 12
-    require_lowercase                = true
-    require_uppercase                = true
-    require_numbers                  = true
-    require_symbols                  = true
-    temporary_password_validity_days = 7
-  }
-
-  # H2: TOTP MFA — OPTIONAL during rollout so existing users are not locked out.
-  # Set cognito_mfa_required=true in prod.tfvars once all users have enrolled.
-  # A lifecycle precondition below warns operators that prod should enforce MFA.
-  mfa_configuration = var.cognito_mfa_required ? "ON" : "OPTIONAL"
-  software_token_mfa_configuration {
-    enabled = true
-  }
-
-  account_recovery_setting {
-    recovery_mechanism {
-      name     = "verified_email"
-      priority = 1
-    }
-  }
-
-  admin_create_user_config {
-    allow_admin_create_user_only = true
-  }
-
-  # #79: native deletion protection in prod only (replaces lifecycle.prevent_destroy, which
-  # couldn't be env-aware and blocked test teardown). prod = ACTIVE, non-prod = INACTIVE.
-  deletion_protection = local.prod_protected ? "ACTIVE" : "INACTIVE"
-
-  lifecycle {
-    # H2: production portals must enforce MFA — a compromised password alone would grant
-    # full portal access including compute submission and EFS home directory reads.
-    # Set cognito_mfa_required=true in prod.tfvars after users have enrolled TOTP.
-    precondition {
-      condition     = var.environment != "prod" || var.cognito_mfa_required
-      error_message = "Production Cognito deployments require cognito_mfa_required=true. Set this in prod.tfvars after users complete TOTP enrollment to enforce MFA for all logins."
-    }
-  }
-}
-
-resource "aws_cognito_user_pool_domain" "ood" {
-  count        = var.use_cognito ? 1 : 0
-  domain       = "ood-${var.environment}-${data.aws_vpc.selected.id}"
-  user_pool_id = aws_cognito_user_pool.ood[0].id
-}
-
-resource "aws_cognito_user_pool_client" "ood" {
-  count        = var.use_cognito ? 1 : 0
-  name         = "ood-portal-${var.environment}"
-  user_pool_id = aws_cognito_user_pool.ood[0].id
-
-  generate_secret                      = true
-  allowed_oauth_flows_user_pool_client = true
-  allowed_oauth_flows                  = ["code"]
-  allowed_oauth_scopes                 = ["openid", "email", "profile"]
-
-  # A stable HTTPS callback is required for the OIDC code flow. The precondition
-  # below guarantees either a domain or an ALB exists, so these branches always
-  # resolve to a real, reachable host (no localhost fallback — see #25).
-  #
-  # #60: the path is `/oidc`, NOT `/oidc/callback`. OOD's ood_portal.yml sets
-  # `oidc_uri: /oidc`, so mod_auth_openidc's OIDCRedirectURI — the redirect_uri it sends to
-  # Cognito — is `/oidc`. The registered callback must match that exact path or Cognito
-  # rejects the round-trip after the user authenticates.
-  callback_urls = var.domain_name != "" ? [
-    "https://${var.domain_name}/oidc"
-    ] : [
-    "https://${aws_lb.ood[0].dns_name}/oidc"
-  ]
-
-  logout_urls = var.domain_name != "" ? [
-    "https://${var.domain_name}"
-    ] : [
-    "https://${aws_lb.ood[0].dns_name}"
-  ]
-
-  supported_identity_providers = var.cognito_saml_metadata_url != "" ? [
-    "COGNITO",
-    aws_cognito_identity_provider.saml[0].provider_name,
-    ] : [
-    "COGNITO"
-  ]
-
-  explicit_auth_flows = ["ALLOW_REFRESH_TOKEN_AUTH"]
-
-  lifecycle {
-    # #25: a no-ALB, no-domain deployment has no stable HTTPS endpoint to serve as
-    # the OIDC redirect target — the portal would come up with no working browser
-    # login. An ephemeral instance public IP is not viable (changes on every
-    # replacement, no TLS cert). Fail fast at plan with actionable guidance rather
-    # than producing a portal nobody can log into.
-    precondition {
-      condition     = !(var.use_cognito && !var.enable_alb && var.domain_name == "")
-      error_message = "Cognito browser auth requires a stable HTTPS callback URL. Set enable_alb=true, or provide domain_name. A no-ALB, no-domain deployment has no working portal login (the instance public IP cannot serve as a reliable OIDC redirect target)."
-    }
-  }
-}
-
-resource "aws_cognito_identity_provider" "saml" {
-  count         = var.use_cognito && var.cognito_saml_metadata_url != "" ? 1 : 0
-  user_pool_id  = aws_cognito_user_pool.ood[0].id
-  provider_name = "InCommon"
-  provider_type = "SAML"
-
-  provider_details = {
-    MetadataURL             = var.cognito_saml_metadata_url
-    IDPSignout              = "true"
-    RequestSigningAlgorithm = "rsa-sha256"
-  }
-
-  attribute_mapping = {
-    email    = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"
-    username = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier"
-  }
-}
-
-# ---------------------------------------------------------------------------
-# DynamoDB — UID mapping table (replaces LDAP for cloud-native auth)
-# ---------------------------------------------------------------------------
-resource "aws_dynamodb_table" "uid_map" {
-  count        = var.enable_dynamodb_uid ? 1 : 0
-  name         = "oid-uid-map-${var.environment}"
-  billing_mode = "PAY_PER_REQUEST"
-  # #39: keyed on `username` (the cognito:username claim — see #64). The account-provisioning
-  # PAM hook (pam_exec → ood-provision-user) only receives PAM_USER, not the OIDC sub,
-  # so username is the lookup key. Rows are {username, uid}; a "__uid_counter__" sentinel
-  # item holds the next_uid for atomic allocation.
-  hash_key = "username"
-
-  # #79: native deletion protection in prod only (replaces lifecycle.prevent_destroy, which
-  # couldn't be env-aware and blocked test teardown). PITR still recovers rows if needed.
-  deletion_protection_enabled = local.prod_protected
-
-  attribute {
-    name = "username"
-    type = "S"
-  }
-
-  point_in_time_recovery {
-    enabled = true
-  }
-
-  # DynamoDB always encrypts at rest; this block only selects the KEY (CMK when
-  # enable_kms_cmk=true, else the AWS-owned key — the free-tier default).
-  server_side_encryption {
-    enabled     = var.enable_kms_cmk #tfsec:ignore:aws-dynamodb-enable-at-rest-encryption
-    kms_key_arn = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
-  }
-
-  tags = {
-    Name = "oid-uid-map-${var.environment}"
-  }
-}
-
-# ---------------------------------------------------------------------------
 # EFS — /home filesystem
 # ---------------------------------------------------------------------------
 resource "aws_efs_file_system" "home" {
@@ -937,15 +736,6 @@ resource "aws_elasticache_replication_group" "ood" {
   tags = {
     Name = "ood-session-cache-${var.environment}"
   }
-}
-
-# #37: oidc-auth-broker v0.3.x requires security.token_encryption_key (a 32-byte
-# base64 key). Generate it here and stash in SSM SecureString; userdata.sh injects it
-# into broker.yaml at boot. 32 raw bytes → base64 is what `openssl rand -base64 32` yields.
-resource "random_password" "broker_token_key" {
-  count   = var.use_cognito ? 1 : 0
-  length  = 32
-  special = false # base64-encoded in userdata; keep the raw value alphanumeric-safe
 }
 
 resource "random_password" "redis_auth" {
@@ -1244,19 +1034,6 @@ resource "aws_s3_object" "bake" {
   kms_key_id             = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
 }
 
-# #39: account-provisioning helper, fetched by userdata.sh and invoked by the pam_exec
-# hook to materialize local accounts from the DynamoDB UID map on first login.
-resource "aws_s3_object" "provision_user" {
-  count       = var.enable_dynamodb_uid ? 1 : 0
-  bucket      = aws_s3_bucket.artifacts.id
-  key         = "ood-provision-user.sh"
-  source      = "${path.module}/../scripts/ood-provision-user.sh"
-  source_hash = filemd5("${path.module}/../scripts/ood-provision-user.sh")
-
-  server_side_encryption = var.enable_kms_cmk ? "aws:kms" : "AES256"
-  kms_key_id             = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
-}
-
 # ---------------------------------------------------------------------------
 # SSM Parameter Store — runtime config for userdata.sh
 # ---------------------------------------------------------------------------
@@ -1265,91 +1042,6 @@ resource "aws_ssm_parameter" "ood_domain" {
   name  = "/ood/${var.environment}/domain_name"
   type  = "String"
   value = var.domain_name
-}
-
-resource "aws_ssm_parameter" "oidc_client_id" {
-  count = var.enable_parameter_store && var.use_cognito ? 1 : 0
-  name  = "/ood/${var.environment}/oidc_client_id"
-  type  = "String"
-  value = var.use_cognito ? aws_cognito_user_pool_client.ood[0].id : var.oidc_client_id
-}
-
-# OIDC client secret stored in Secrets Manager — NOT SSM — to reduce blast radius (H2).
-# The secret ARN is stored in SSM as a non-sensitive pointer; userdata.sh fetches
-# the secret value at runtime via secretsmanager:GetSecretValue.
-resource "aws_secretsmanager_secret" "oidc_client_secret" {
-  count                   = var.use_cognito ? 1 : 0
-  name                    = "ood/${var.environment}/oidc-client-secret"
-  recovery_window_in_days = var.environment == "prod" ? 30 : (var.environment == "staging" ? 14 : 7) # N5: staging gets 14d; test keeps 7d
-  kms_key_id              = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
-
-  tags = { Name = "ood-oidc-secret-${var.environment}" }
-}
-
-resource "aws_secretsmanager_secret_version" "oidc_client_secret" {
-  count         = var.use_cognito ? 1 : 0
-  secret_id     = aws_secretsmanager_secret.oidc_client_secret[0].id
-  secret_string = aws_cognito_user_pool_client.ood[0].client_secret
-}
-
-# H2: automatic rotation — requires a Lambda that regenerates the Cognito app client
-# secret and updates the Secrets Manager value. Wire via oidc_secret_rotation_lambda_arn.
-# Without a Lambda, ops must manually rotate every 90 days and update the secret version.
-resource "aws_secretsmanager_secret_rotation" "oidc_client_secret" {
-  count               = var.use_cognito && var.oidc_secret_rotation_lambda_arn != "" ? 1 : 0
-  secret_id           = aws_secretsmanager_secret.oidc_client_secret[0].id
-  rotation_lambda_arn = var.oidc_secret_rotation_lambda_arn
-
-  rotation_rules {
-    automatically_after_days = 90
-  }
-
-  lifecycle {
-    # H2: prod deployments must have automatic rotation — manual rotation is error-prone
-    # and a missed rotation causes all user logins to fail for the full rotation window.
-    # Build a rotation Lambda and set oidc_secret_rotation_lambda_arn in prod.tfvars.
-    # See docs/identity-guide.md for the rotation Lambda implementation.
-    precondition {
-      condition     = var.environment != "prod" || var.oidc_secret_rotation_lambda_arn != ""
-      error_message = "Production deployments require oidc_secret_rotation_lambda_arn to enable automatic OIDC secret rotation. Manual rotation every 90 days is not acceptable for prod."
-    }
-  }
-}
-
-# H3: Alert when Secrets Manager rotation fails — a failed rotation means the OIDC
-# secret will expire at the end of the current rotation window, causing all logins to
-# fail. Operators must investigate and re-trigger rotation before the expiry deadline.
-resource "aws_cloudwatch_metric_alarm" "oidc_rotation_failure" {
-  count               = var.use_cognito && var.enable_monitoring && var.oidc_secret_rotation_lambda_arn != "" ? 1 : 0
-  alarm_name          = "ood-${var.environment}-oidc-rotation-failure"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 1
-  metric_name         = "RotationFailed"
-  namespace           = "AWS/SecretsManager"
-  period              = 3600
-  statistic           = "Sum"
-  threshold           = 1
-  treat_missing_data  = "notBreaching" # No rotation activity = healthy; rotation failure is an event
-  alarm_description   = "OIDC client secret rotation failed — the secret will expire in <90 days causing all portal logins to fail. Investigate the rotation Lambda and re-trigger: aws secretsmanager rotate-secret --secret-id ${aws_secretsmanager_secret.oidc_client_secret[0].id}"
-  alarm_actions       = [aws_sns_topic.ood[0].arn]
-  dimensions = {
-    SecretId = aws_secretsmanager_secret.oidc_client_secret[0].id
-  }
-}
-
-# SSM pointer to the Secrets Manager ARN (non-sensitive — just a name/ARN)
-resource "aws_ssm_parameter" "oidc_client_secret_arn" {
-  count = var.enable_parameter_store && var.use_cognito ? 1 : 0
-  name  = "/ood/${var.environment}/oidc_client_secret_arn"
-  type  = "String"
-  value = aws_secretsmanager_secret.oidc_client_secret[0].arn
-}
-
-resource "aws_ssm_parameter" "oidc_issuer_url" {
-  count = var.enable_parameter_store && var.use_cognito ? 1 : 0
-  name  = "/ood/${var.environment}/oidc_issuer_url"
-  type  = "String"
-  value = var.use_cognito ? "https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.ood[0].id}" : var.oidc_issuer_url
 }
 
 resource "aws_ssm_parameter" "efs_id" {
@@ -1366,13 +1058,6 @@ resource "aws_ssm_parameter" "efs_access_point_id" {
   value = aws_efs_access_point.home[0].id
 }
 
-resource "aws_ssm_parameter" "dynamodb_uid_table" {
-  count = var.enable_parameter_store && var.enable_dynamodb_uid ? 1 : 0
-  name  = "/ood/${var.environment}/dynamodb_uid_table"
-  type  = "String"
-  value = aws_dynamodb_table.uid_map[0].name
-}
-
 # M5: split endpoint URL (non-secret) from auth token (secret) so the token
 # never appears in SSM history for a plain String parameter
 resource "aws_ssm_parameter" "redis_endpoint" {
@@ -1387,16 +1072,6 @@ resource "aws_ssm_parameter" "redis_auth_token" {
   name   = "/ood/${var.environment}/redis_auth_token"
   type   = "SecureString"
   value  = random_password.redis_auth[0].result
-  key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
-}
-
-# #37: token_encryption_key for oidc-auth-broker, base64-encoded (openssl rand -base64 32
-# equivalent). userdata.sh reads this and writes it into broker.yaml security block.
-resource "aws_ssm_parameter" "broker_token_key" {
-  count  = var.enable_parameter_store && var.use_cognito ? 1 : 0
-  name   = "/ood/${var.environment}/broker_token_key"
-  type   = "SecureString"
-  value  = base64encode(random_password.broker_token_key[0].result)
   key_id = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
 }
 
@@ -1469,7 +1144,6 @@ resource "aws_launch_template" "ood" {
     "export OOD_LOG_GROUP_PREFIX='/aws/ec2/ood-${var.environment}'",
     "export OOD_DOMAIN='${var.domain_name}'",
     "export OOD_ALB_DNS='${var.enable_alb ? aws_lb.ood[0].dns_name : ""}'",
-    "export OOD_OIDC_PAM_VERSION='${var.oidc_pam_version}'",
     "export OOD_USE_SSSD='${tostring(var.use_sssd)}'",        # #78: directory-backed POSIX identity
     "export ARTIFACT_BUCKET='${aws_s3_bucket.artifacts.id}'", # exported so the fetched userdata.sh child inherits it (#49)
     ],
@@ -1506,13 +1180,13 @@ resource "aws_launch_template" "ood" {
   lifecycle {
     precondition {
       condition     = local.spot_prereqs_met
-      error_message = "spot profile requires enable_efs=true, enable_dynamodb_uid=true, and use_cognito=true."
+      error_message = "spot profile requires enable_efs=true (EFS-backed /home so a Spot interruption that replaces the instance does not lose user data)."
     }
   }
 
   # The bootstrap scripts must exist in S3 before any instance boots and runs the
   # user_data stub that fetches them (#16).
-  depends_on = [aws_s3_object.userdata, aws_s3_object.bake, aws_s3_object.provision_user]
+  depends_on = [aws_s3_object.userdata, aws_s3_object.bake]
 }
 
 resource "aws_autoscaling_group" "ood" {
@@ -2064,11 +1738,12 @@ resource "aws_vpc_endpoint" "interfaces" {
 }
 
 # H1: Scope interface endpoint policies so only the OOD instance role can use each endpoint.
-# Secrets Manager policy also allows the rotation Lambda ARN when configured.
+# The Secrets Manager policy scopes to the #78 directory admin/bind secrets the OOD host
+# fetches at boot (SSSD domain join + Dex LDAP bind).
 # ssmmessages and ec2messages require a broader action set for SSM Session Manager to work.
 
 resource "aws_vpc_endpoint_policy" "secretsmanager" {
-  count           = var.enable_vpc_endpoints && var.use_cognito ? 1 : 0
+  count           = var.enable_vpc_endpoints && (var.use_sssd || var.enable_directory) ? 1 : 0
   vpc_endpoint_id = aws_vpc_endpoint.interfaces["secretsmanager"].id
   policy = jsonencode({
     Version = "2012-10-17"
@@ -2077,7 +1752,10 @@ resource "aws_vpc_endpoint_policy" "secretsmanager" {
       Effect    = "Allow"
       Principal = { AWS = aws_iam_role.ood.arn }
       Action    = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
-      Resource  = aws_secretsmanager_secret.oidc_client_secret[0].arn
+      Resource = compact([
+        var.enable_directory ? aws_secretsmanager_secret.directory_admin[0].arn : "",
+        var.use_sssd ? aws_secretsmanager_secret.directory_bind[0].arn : "",
+      ])
     }]
   })
 }
@@ -3520,15 +3198,14 @@ resource "aws_backup_plan" "ood" {
 }
 
 resource "aws_backup_selection" "ood" {
-  # M9: include S3 browser bucket alongside EFS + DynamoDB
-  count        = var.enable_backup && (var.enable_efs || var.enable_dynamodb_uid || var.enable_s3_browser) ? 1 : 0
+  # M9: include S3 browser bucket alongside EFS
+  count        = var.enable_backup && (var.enable_efs || var.enable_s3_browser) ? 1 : 0
   iam_role_arn = aws_iam_role.backup[0].arn
   name         = "ood-${var.environment}"
   plan_id      = aws_backup_plan.ood[0].id
 
   resources = concat(
     var.enable_efs ? [aws_efs_file_system.home[0].arn] : [],
-    var.enable_dynamodb_uid ? [aws_dynamodb_table.uid_map[0].arn] : [],
     var.enable_s3_browser ? [aws_s3_bucket.ood_files[0].arn] : [],
   )
 }

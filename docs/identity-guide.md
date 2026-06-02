@@ -1,98 +1,85 @@
 # Identity Guide
 
-This guide covers OIDC provider setup and identity configuration for aws-openondemand.
+This guide covers identity configuration for aws-openondemand — how the portal authenticates
+users and resolves their POSIX accounts.
 
 > **Designing a deployment?** Read [reference-architecture.md](reference-architecture.md)
-> first — it explains the prescribed identity model (OOD defers auth to an OIDC IdP via Dex
-> and POSIX identity to a directory via SSSD; bring your own directory in production, or use
-> the in-account Simple AD eval mode) and why. This guide is the operator how-to; the
-> reference architecture is the design intent. The Cognito/`oidc-pam` material below is the
-> legacy path being retired (see the reference's Migration & cutover section).
+> first — it explains the model and the trade-offs. This guide is the operator how-to.
 
 ## Overview
 
-aws-openondemand replaces traditional LDAP/NIS with a cloud-native identity stack:
+OOD **defers identity**; it does not manufacture accounts. Two concerns, both pointed at a
+**directory** (Active Directory / LDAP):
 
-- **Cognito User Pool** — OIDC identity provider (or bring your own IdP)
-- **oidc-pam** — translates OIDC tokens into PAM/NSS Unix identity
-- **DynamoDB** — UID mapping table (`oid-uid-map-<env>`) replacing `/etc/passwd`
+- **Web auth** — OOD's bundled **Dex** authenticates users via an **LDAP connector** bound to
+  the directory. `ood-portal-generator` reads the `dex:` block in `ood_portal.yml` and emits
+  the Apache `mod_auth_openidc` vhost automatically.
+- **POSIX identity** — **SSSD/NSS** resolves `getpwnam` against the **same** directory, and
+  `oddjob-mkhomedir` creates homes on first login. No account creation at login time.
 
-## Cloud-Native Progression Levels
+Because both use the same directory, the OIDC username **equals** the Unix account by
+construction — no claim-to-username mapping.
 
-| Level | Toggle | What it unlocks |
-|-------|--------|----------------|
-| 0 | (base) | OOD on EC2, local auth |
-| 2 | `enable_dynamodb_uid=true` | OIDC sub → UID mapping in DynamoDB |
-| 3 | `use_cognito=true` | Cognito OIDC replaces local PAM/LDAP |
+This replaced the previous Cognito + `oidc-pam` + DynamoDB-UID + login-time-`useradd` stack,
+which could not work on OOD 4.x (`nginx_stage` resolves the user before any provisioning hook
+runs). See the reference architecture's *Migration & cutover* section for the history.
 
-## Cognito Setup
+## Two modes (see reference-architecture.md §2)
 
-When `use_cognito=true` (default), Terraform/CDK creates:
-- A Cognito User Pool (`ood-<env>`)
-- An App Client with PKCE/code flow
-- SSM Parameters with the OIDC client ID, secret, and issuer URL
+| Mode | Directory | Toggles |
+|------|-----------|---------|
+| **Eval** (single account) | in-account **AWS Simple AD**, provisioned for you | `enable_directory=true`, `use_sssd=true` |
+| **Production** (bring your own) | your existing AD / LDAP | `use_sssd=true`, `directory_ldap_uri=ldaps://...` (+ bind/search vars) |
 
-The `userdata.sh` script reads these SSM parameters at boot and configures:
-- `/etc/oidc-auth/broker.yaml` — oidc-auth-broker config
-- `/etc/pam.d/ood` — PAM module config (`pam_oidc.so`)
+## Configuration
 
-> **PAM-only (oidc-pam v0.3.x).** oidc-pam ships no NSS module, so there is no
-> `/etc/nsswitch.conf` `oidc` entry. The broker authenticates an OIDC identity for an
-> *existing* local account and provisions `~/.ssh`; it does not resolve
-> identity→username via NSS or create the Unix account. Web identity mapping is handled
-> by Apache `mod_auth_openidc` via `oidc_remote_user_claim` in `ood_portal.yml`.
+| Variable | Purpose |
+|----------|---------|
+| `use_sssd` | enable SSSD/NSS + the Dex LDAP connector on the OOD host |
+| `enable_directory` | (eval only) provision an in-account Simple AD and wire to it |
+| `directory_ldap_uri` | LDAP(S) endpoint Dex + SSSD bind to (BYO; the mode selector) |
+| `directory_name` | the AD / SSSD domain (e.g. `corp.example.com`) |
+| `directory_bind_dn` / `directory_user_base_dn` / `directory_user_filter` | Dex userSearch coordinates |
+| `directory_username_attr` | attribute used as the OOD/Unix username (default `sAMAccountName` — a bare name that matches the POSIX account) |
+| *(bind password)* | Secrets Manager `ood/<env>/directory-bind-password` (operator-populated for BYO; auto-filled in eval) |
 
-### Local account provisioning
+## How it works at boot
 
-Because oidc-pam does not create accounts, OOD materializes them itself on first login
-(replacing the dropped NSS/LDAP model). The PAM stack runs, in order:
+`userdata.sh` reads the directory coordinates from SSM (`/ood/<env>/directory_*`), fetches the
+bind password from Secrets Manager, and:
 
-1. `pam_oidc.so` — authenticate the OIDC identity (broker, device flow).
-2. `pam_exec.so /usr/local/bin/ood-provision-user` — allocate a **stable UID** from the
-   DynamoDB UID map (`oid-uid-map-<env>`, keyed on `username`, atomic counter +
-   conditional put) and `useradd` the account if it doesn't exist. Idempotent.
-3. `pam_mkhomedir.so` — create the home directory under `/home` (EFS-backed, so homes and
-   UIDs are consistent across the portal and any compute nodes).
+1. Joins the host to the directory and enables SSSD (`authselect select sssd with-mkhomedir`),
+   so `getpwnam` resolves users and `oddjobd` creates homes under `/home` on first login.
+2. Writes the `dex:` block (with the LDAP connector) into `/etc/ood/config/ood_portal.yml` and
+   runs `update_ood_portal`, which emits the Apache OIDC vhost and starts `ondemand-dex`.
 
-UID allocation uses a `__uid_counter__` sentinel item in the table, so the same username
-gets the same UID on every instance. Requires `enable_dynamodb_uid = true` (the default);
-with it off, the hook no-ops and accounts must be provisioned by other means
-(SSSD/directory sync). See `scripts/ood-provision-user.sh`.
+There is **no** `useradd`, no DynamoDB UID map, no `oidc-auth-broker`, and no hand-maintained
+`oidc_*` Apache config — the directory is the single source of truth and the generator owns the
+vhost.
 
-To give a *job* (rather than the login session) narrower, expiring AWS credentials under a
-per-PI or per-job IAM role instead of the instance role, see
-[Scoping job credentials with aws-role-exec](adapter-guide.md#scoping-job-credentials-with-aws-role-exec)
-in the adapter guide.
+## Username alignment
 
-## InCommon / Shibboleth Federation
+The OOD username comes from the Dex connector's `userSearch.username` attribute
+(`directory_username_attr`, default `sAMAccountName`). Use a bare-name attribute (not
+`userPrincipalName`/email) so REMOTE_USER matches the POSIX account SSSD resolves. UIDs come
+from the directory (SSSD `ldap_id_mapping` for AD, or the directory's `uidNumber`), so they are
+stable across the portal and any compute nodes that read the same directory.
 
-Set `cognito_saml_metadata_url` to your institution's InCommon metadata URL:
+## Per-job AWS credentials
 
-```hcl
-cognito_saml_metadata_url = "https://incommon.org/federation/metadata/..."
-```
-
-Cognito acts as a SAML SP and presents OIDC to OOD — no changes needed to the OOD config.
-
-## oidc-pam Configuration
-
-`/etc/oidc-auth/broker.yaml` (generated at boot):
-
-```yaml
-issuer: "https://cognito-idp.us-east-1.amazonaws.com/<pool-id>"
-client_id: "<app-client-id>"
-client_secret: "<app-client-secret>"
-dynamodb_table: "oid-uid-map-test"
-aws_region: "us-east-1"
-uid_range_min: 10000
-uid_range_max: 60000
-home_dir_prefix: /home
-```
-
-UIDs in the range 10000–60000 are allocated automatically on first login and persisted in DynamoDB.
+To give a *job* narrower, expiring AWS credentials under a per-PI/per-job IAM role instead of
+the instance role, see
+[Scoping job credentials with aws-role-exec](adapter-guide.md#scoping-job-credentials-with-aws-role-exec).
+(Per-user cross-account `AssumeRole` for the compute adapters is a planned follow-up — see
+[reference-architecture.md](reference-architecture.md) §4.)
 
 ## Troubleshooting
 
-- **"User not found" errors**: check `systemctl status oidc-auth-broker` and `journalctl -u oidc-auth-broker`
-- **UID not assigned**: check DynamoDB table `oid-uid-map-<env>` for the user's OIDC sub
-- **PAM rejecting tokens**: verify `OOD_OIDC_ISSUER_URL` in SSM matches the Cognito User Pool endpoint
+- **"can't find user" / PUN won't start**: `getpwnam` isn't resolving. Check
+  `id <user>` and `systemctl status sssd`; verify the host joined the realm (`realm list`) and
+  the directory is reachable on LDAP(S).
+- **Login fails at Dex**: check `journalctl -u ondemand-dex`; verify the bind DN/password and
+  `userSearch` baseDN/filter match your directory.
+- **Generator fell back to need_auth**: `grep openid-connect /etc/httpd/conf.d/ood-portal.conf`
+  — if absent, the `dex:` block didn't render; check `ondemand-dex` is installed and the block
+  is valid YAML.

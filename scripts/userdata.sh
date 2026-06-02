@@ -52,14 +52,15 @@ if [ "${OOD_ENABLE_PARAMETER_STORE}" = "true" ]; then
         domain_name) OOD_DOMAIN="${value}" ;;
         efs_id) OOD_EFS_ID="${value}" ;;
         efs_access_point_id) OOD_EFS_ACCESS_POINT_ID="${value}" ;;
-        dynamodb_uid_table) OOD_DYNAMODB_UID_TABLE="${value}" ;;
-        oidc_client_id) OOD_OIDC_CLIENT_ID="${value}" ;;
-        oidc_client_secret_arn) OOD_OIDC_CLIENT_SECRET_ARN="${value}" ;; # H2: ARN pointer only
-        oidc_issuer_url) OOD_OIDC_ISSUER_URL="${value}" ;;
         redis_endpoint) OOD_REDIS_ENDPOINT="${value}" ;;
-        broker_token_key) OOD_BROKER_TOKEN_KEY="${value}" ;; # #37: broker token_encryption_key
-        directory_name) OOD_DIRECTORY_NAME="${value}" ;;     # #78: SSSD/AD domain
-        directory_dns_ips) OOD_DIRECTORY_DNS_IPS="${value}" ;; # #78: AD DNS resolvers
+        # #78: directory coordinates for SSSD (POSIX) + the Dex LDAP connector (web auth).
+        directory_name) OOD_DIRECTORY_NAME="${value}" ;;
+        directory_dns_ips) OOD_DIRECTORY_DNS_IPS="${value}" ;;
+        directory_ldap_uri) OOD_DIRECTORY_LDAP_URI="${value}" ;;
+        directory_bind_dn) OOD_DIRECTORY_BIND_DN="${value}" ;;
+        directory_user_base_dn) OOD_DIRECTORY_USER_BASE_DN="${value}" ;;
+        directory_user_filter) OOD_DIRECTORY_USER_FILTER="${value}" ;;
+        directory_username_attr) OOD_DIRECTORY_USERNAME_ATTR="${value}" ;;
       esac
     done <"${SSM_DUMP}"
     echo "=== SSM parameters loaded ==="
@@ -70,39 +71,35 @@ if [ "${OOD_ENABLE_PARAMETER_STORE}" = "true" ]; then
 fi
 
 # Fallback defaults for SSM-sourced vars
-OOD_DYNAMODB_UID_TABLE="${OOD_DYNAMODB_UID_TABLE:-}"
-OOD_OIDC_CLIENT_ID="${OOD_OIDC_CLIENT_ID:-}"
-OOD_OIDC_CLIENT_SECRET_ARN="${OOD_OIDC_CLIENT_SECRET_ARN:-}"
-OOD_OIDC_ISSUER_URL="${OOD_OIDC_ISSUER_URL:-}"
-OOD_BROKER_TOKEN_KEY="${OOD_BROKER_TOKEN_KEY:-}"
 OOD_DIRECTORY_NAME="${OOD_DIRECTORY_NAME:-}"
 OOD_DIRECTORY_DNS_IPS="${OOD_DIRECTORY_DNS_IPS:-}"
+OOD_DIRECTORY_LDAP_URI="${OOD_DIRECTORY_LDAP_URI:-}"
+OOD_DIRECTORY_BIND_DN="${OOD_DIRECTORY_BIND_DN:-}"
+OOD_DIRECTORY_USER_BASE_DN="${OOD_DIRECTORY_USER_BASE_DN:-}"
+OOD_DIRECTORY_USER_FILTER="${OOD_DIRECTORY_USER_FILTER:-}"
+OOD_DIRECTORY_USERNAME_ATTR="${OOD_DIRECTORY_USERNAME_ATTR:-}"
 OOD_USE_SSSD="${OOD_USE_SSSD:-false}"
 
-# Fetch OIDC client secret from Secrets Manager (never stored in SSM or userdata) (H2)
-OOD_OIDC_CLIENT_SECRET=""
-if [ -n "${OOD_OIDC_CLIENT_SECRET_ARN}" ]; then
-  # L3: capture stderr so AccessDeniedException and other errors are visible in bootstrap log
+# #78: fetch the directory BIND password from Secrets Manager (never in SSM/user_data). The
+# Dex LDAP connector binds with it to search the directory. Eval mode auto-fills the secret
+# from the Simple AD admin password; BYO deployments have the operator populate it.
+OOD_DIRECTORY_BIND_PW=""
+if [ "${OOD_USE_SSSD}" = "true" ]; then
   SM_ERROR_LOG=$(mktemp)
-  # L1: ensure temp file is removed even if the script exits unexpectedly (signal, set -e, etc.)
   trap 'rm -f "${SM_ERROR_LOG}"' EXIT
-  OOD_OIDC_CLIENT_SECRET=$(aws secretsmanager get-secret-value \
+  OOD_DIRECTORY_BIND_PW=$(aws secretsmanager get-secret-value \
     --region "${AWS_REGION}" \
-    --secret-id "${OOD_OIDC_CLIENT_SECRET_ARN}" \
-    --query 'SecretString' \
-    --output text 2>"${SM_ERROR_LOG}" || echo "")
-  if [ -z "${OOD_OIDC_CLIENT_SECRET}" ]; then
-    # L3: OIDC secret is required for portal authentication — abort if retrieval fails.
-    # A missing secret would launch a portal that silently rejects all logins.
-    echo "FATAL: Failed to retrieve OIDC client secret from Secrets Manager"
-    echo "  Secret ARN: ${OOD_OIDC_CLIENT_SECRET_ARN}"
+    --secret-id "ood/${OOD_ENVIRONMENT}/directory-bind-password" \
+    --query 'SecretString' --output text 2>"${SM_ERROR_LOG}" || echo "")
+  if [ -z "${OOD_DIRECTORY_BIND_PW}" ]; then
+    echo "FATAL: could not fetch directory bind password (#78) — Dex cannot bind LDAP, web login will fail."
+    echo "  Secret: ood/${OOD_ENVIRONMENT}/directory-bind-password"
     echo "  AWS error: $(cat "${SM_ERROR_LOG}")"
-    echo "  Check: IAM role has secretsmanager:GetSecretValue on this ARN"
+    echo "  Check the instance role has secretsmanager:GetSecretValue on that secret, and that it is populated."
     rm -f "${SM_ERROR_LOG}"
     exit 1
-  else
-    echo "=== OIDC client secret retrieved from Secrets Manager ==="
   fi
+  echo "=== directory bind password retrieved from Secrets Manager ==="
   rm -f "${SM_ERROR_LOG}"
 fi
 OOD_REDIS_ENDPOINT="${OOD_REDIS_ENDPOINT:-}"
@@ -219,297 +216,71 @@ if [ "${OOD_ENABLE_FSX}" = "true" ] && [ -n "${OOD_FSX_DNS_NAME}" ]; then
 fi
 
 ###############################################################################
-# 3. Configure oidc-auth-broker (reads from /etc/oidc-auth/broker.yaml)
+# 3 + 4. Web auth: OOD Dex with an LDAP connector → the directory (#78)
 ###############################################################################
-# Runtime fallback (#26): the baked AMI is expected to ship oidc-pam (installed by
-# bake.sh), but older/partial AMIs may lack the oidc-auth-broker binary, leaving the
-# systemd unit pointing at a missing ExecStart. If it's absent, install oidc-pam now
-# using the same download + checksum-verify + fail-closed logic as bake.sh. This makes
-# userdata self-healing regardless of AMI vintage. (Durable fix is also rebuilding the
-# AMI, which is out-of-band Packer infra.)
-if [ -n "${OOD_OIDC_CLIENT_ID}" ] && [ -n "${OOD_OIDC_ISSUER_URL}" ] && [ ! -x /usr/local/bin/oidc-auth-broker ]; then
-  echo "=== oidc-auth-broker binary missing — installing oidc-pam ${OOD_OIDC_PAM_VERSION:-} at boot ==="
-  if [ -z "${OOD_OIDC_PAM_VERSION:-}" ]; then
-    echo "WARNING: OOD_OIDC_PAM_VERSION not set — cannot install oidc-pam at boot; broker will not start"
-  else
-    case "$(uname -m)" in
-      x86_64) _OIDC_ARCH="amd64" ;;
-      aarch64) _OIDC_ARCH="arm64" ;;
-      *) _OIDC_ARCH="$(uname -m)" ;;
-    esac
-    # Real release asset naming (#34): oidc-pam-<ver>-linux-<arch>.tar.gz with a
-    # per-asset <asset>.sha256 sidecar (format: "<hash>  <filename>"). The tarball
-    # extracts to a versioned subdir, so place the binaries explicitly afterward.
-    # NOTE: keep this in sync with the identical install logic in scripts/bake.sh.
-    _OIDC_BASE="https://github.com/scttfrdmn/oidc-pam/releases/download/${OOD_OIDC_PAM_VERSION}"
-    _OIDC_ASSET="oidc-pam-${OOD_OIDC_PAM_VERSION}-linux-${_OIDC_ARCH}.tar.gz"
-    _OIDC_DIR="oidc-pam-${OOD_OIDC_PAM_VERSION}-linux-${_OIDC_ARCH}"
-    _OIDC_TMP=$(mktemp -d)
-    if curl -fsSL "${_OIDC_BASE}/${_OIDC_ASSET}" -o "${_OIDC_TMP}/${_OIDC_ASSET}" &&
-      curl -fsSL "${_OIDC_BASE}/${_OIDC_ASSET}.sha256" -o "${_OIDC_TMP}/${_OIDC_ASSET}.sha256"; then
-      _OIDC_EXP=$(awk '{print $1}' "${_OIDC_TMP}/${_OIDC_ASSET}.sha256")
-      _OIDC_ACT=$(sha256sum "${_OIDC_TMP}/${_OIDC_ASSET}" | awk '{print $1}')
-      if [ -n "${_OIDC_EXP}" ] && [ "${_OIDC_EXP}" = "${_OIDC_ACT}" ]; then
-        tar -xz -C "${_OIDC_TMP}" -f "${_OIDC_TMP}/${_OIDC_ASSET}"
-        install -m 0755 "${_OIDC_TMP}/${_OIDC_DIR}/oidc-auth-broker" /usr/local/bin/oidc-auth-broker
-        install -m 0755 "${_OIDC_TMP}/${_OIDC_DIR}/oidc-pam-helper" /usr/local/bin/oidc-pam-helper
-        install -m 0755 "${_OIDC_TMP}/${_OIDC_DIR}/oidc-admin" /usr/local/bin/oidc-admin
-        mkdir -p /usr/lib64/security
-        install -m 0644 "${_OIDC_TMP}/${_OIDC_DIR}/pam_oidc.so" /usr/lib64/security/pam_oidc.so
-        if [ -x /usr/local/bin/oidc-auth-broker ]; then
-          echo "=== oidc-pam ${OOD_OIDC_PAM_VERSION} installed at boot (checksum ${_OIDC_ACT}) ==="
-        else
-          echo "ERROR: oidc-auth-broker not present after extraction — install failed"
-        fi
-      else
-        echo "ERROR: oidc-pam checksum mismatch at boot — not installing (supply chain safety)"
-      fi
-    else
-      echo "ERROR: failed to download oidc-pam ${OOD_OIDC_PAM_VERSION} (${_OIDC_ASSET}) at boot"
-    fi
-    rm -rf "${_OIDC_TMP}"
-  fi
-fi
-
-if [ -n "${OOD_OIDC_CLIENT_ID}" ] && [ -n "${OOD_OIDC_ISSUER_URL}" ]; then
-  echo "=== Configuring oidc-auth-broker ==="
-
-  # #37: oidc-auth-broker v0.3.x requires the nested schema (server/oidc.providers/
-  # authentication/security/audit). The old flat top-level issuer/client_id/... was
-  # rejected with "at least one OIDC provider must be configured". The UID/home/dynamodb
-  # keys have no place in this schema — local-account provisioning is separate (see #39).
-  cat > /etc/oidc-auth/broker.yaml <<BROKERCONF
-server:
-  socket_path: "/var/run/oidc-auth/broker.sock"
-  log_level: "info"
-  audit_log: "/var/log/oidc-auth/audit.log"
-
-oidc:
-  providers:
-    - name: "cognito"
-      issuer: "${OOD_OIDC_ISSUER_URL}"
-      client_id: "${OOD_OIDC_CLIENT_ID}"
-      client_secret: "${OOD_OIDC_CLIENT_SECRET}"
-      scopes: ["openid", "email", "profile"]
-      user_mapping:
-        # #75: key on email (cognito:username is the sub UUID under email-login). The broker
-        # is the SSH/PAM path and can't regex-extract, so it sees the full email — a known
-        # minor divergence from the web path's local-part (web uses an OIDCRemoteUserClaim
-        # regex). SSH-via-oidc-pam is not the primary tested path; revisit if it becomes one.
-        username_claim: "email"
-        email_claim: "email"
-        name_claim: "name"
-      priority: 1
-      enabled_for_login: true
-      verification_only: false
-
-authentication:
-  token_lifetime: "8h"
-  refresh_threshold: "1h"
-  # No group gate by default: Cognito user pools carry no 'groups' claim unless
-  # configured. Institutions federating SAML/groups can require specific groups here.
-  require_groups: []
-
-security:
-  audit_enabled: true
-  require_pkce: true
-  verify_audience: true
-  clock_skew_tolerance: "5m"
-  token_encryption_key: "${OOD_BROKER_TOKEN_KEY}"
-
-audit:
-  enabled: true
-  format: "json"
-BROKERCONF
-  chmod 600 /etc/oidc-auth/broker.yaml
-
-  # No NSS wiring: oidc-pam v0.3.x is PAM-only and ships no libnss_oidc module
-  # (confirmed in scttfrdmn/oidc-pam#87). The broker authenticates an OIDC identity for
-  # an *already-existing* local account and provisions ~/.ssh; it does not resolve
-  # identity->username via NSS or create the account. OOD materializes the local account
-  # itself via the pam_exec provisioning hook below (#39).
-
-  # Install the account-provisioning helper from the artifact bucket (#39). It allocates a
-  # stable UID from the DynamoDB UID map and runs useradd on first login. Only meaningful
-  # when the UID map is enabled; the helper no-ops if OOD_DYNAMODB_UID_TABLE is empty.
-  # ARTIFACT_BUCKET is exported by the launch-template stub; guard with :- so a missing
-  # value warns instead of aborting the whole bootstrap under set -u (#49) — this block is
-  # only a "session optional" convenience, never worth failing the boot over.
-  if [ -n "${OOD_DYNAMODB_UID_TABLE}" ] && [ -n "${ARTIFACT_BUCKET:-}" ]; then
-    aws s3 cp "s3://${ARTIFACT_BUCKET}/ood-provision-user.sh" /usr/local/bin/ood-provision-user \
-      --region "${AWS_REGION}" && chmod 0755 /usr/local/bin/ood-provision-user
-  elif [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
-    echo "WARNING: ARTIFACT_BUCKET unset — skipping ood-provision-user install; first-login account provisioning unavailable (#49)"
-  fi
-
-  # Configure PAM for OOD authentication. Order matters: pam_oidc authenticates, then the
-  # provisioning hook creates the local account (#39), then pam_mkhomedir creates its home
-  # (on the EFS-mounted /home). This path covers INTERACTIVE logins (ssh/su) which open a
-  # PAM session. NOTE (#67): OOD's WEB login does NOT open a PAM session, so this entry does
-  # not fire on browser login — the nginx_stage pre-hook below is the web-login trigger.
-  cat > /etc/pam.d/ood <<PAMCONF
-auth     required pam_oidc.so
-account  required pam_oidc.so
-session  optional pam_oidc.so
-session  optional pam_exec.so /usr/local/bin/ood-provision-user
-session  optional pam_mkhomedir.so skel=/etc/skel umask=0077
-PAMCONF
-
-  # #67/#69/#71: account provisioning on the WEB-login path is wired through ood_portal.yml's
-  # `pun_pre_hook_root_cmd` (NOT nginx_stage.yml — see the ood_portal.yml generation below for
-  # the full mechanism trace). OOD web auth never opens a PAM session, so the pam_exec entry
-  # above only covers interactive (ssh/su) logins.
-
-  # Make the UID-map table + region available to the pam_exec helper environment.
-  if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
-    cat > /etc/oidc-auth/provision.env <<ENVCONF
-OOD_DYNAMODB_UID_TABLE=${OOD_DYNAMODB_UID_TABLE}
-AWS_REGION=${AWS_REGION}
-ENVCONF
-    chmod 0644 /etc/oidc-auth/provision.env
-  fi
-
-  # Enable and start the oidc-auth-broker service
-  cat > /etc/systemd/system/oidc-auth-broker.service <<'SVCCONF'
-[Unit]
-Description=OIDC Auth Broker for oidc-pam
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/oidc-auth-broker serve --config /etc/oidc-auth/broker.yaml
-Restart=always
-RestartSec=5
-User=root
-
-[Install]
-WantedBy=multi-user.target
-SVCCONF
-
-  systemctl daemon-reload
-  systemctl enable oidc-auth-broker
-  systemctl start oidc-auth-broker
-  # #37: fail loudly if the broker is crash-looping (e.g. a rejected config) rather
-  # than leaving a silently-broken portal. Give it a moment to settle first.
-  sleep 3
-  if systemctl is-active --quiet oidc-auth-broker; then
-    echo "=== oidc-auth-broker started ==="
-  else
-    echo "ERROR: oidc-auth-broker is not active after start — check 'journalctl -u oidc-auth-broker'"
-    journalctl -u oidc-auth-broker --no-pager -n 20 2>/dev/null || true
-  fi
-fi
-
-###############################################################################
-# 4. Generate OOD portal config from SSM parameters
-###############################################################################
-# #35: generate the web-auth layer whenever OIDC is configured — not only when a
-# domain is set. With enable_alb=true and no domain, OOD_DOMAIN is empty but the portal
-# is still reachable at the ALB DNS name, which must be the servername so the OIDC
-# redirect_uri matches the Cognito callback (also registered to the ALB DNS).
-# Precedence: domain > ALB DNS > instance public hostname (last resort).
-if [ -n "${OOD_OIDC_CLIENT_ID}" ] && [ -n "${OOD_OIDC_ISSUER_URL}" ]; then
+# Replaces the bespoke Cognito + oidc-auth-broker + hand-wired mod_auth_openidc stack. OOD's
+# bundled Dex authenticates users via an LDAP connector bound to the SAME directory SSSD reads
+# (see the SSSD block above), so the OIDC username == the POSIX account by construction.
+# ood-portal-generator reads the dex: block from ood_portal.yml and emits BOTH the Dex config
+# and the Apache mod_auth_openidc vhost — so there is NO hand-maintained oidc_*/auth:/
+# OIDCXForwardedHeaders/redirect tuning (the #52/#60/#73/#73 class cannot recur), and NO
+# login-time account provisioning (the #67/#69/#71/#77 dead end is gone — getpwnam resolves
+# via SSSD). See docs/reference-architecture.md.
+if [ "${OOD_USE_SSSD}" = "true" ] && [ -n "${OOD_DIRECTORY_BIND_PW}" ]; then
   SERVERNAME="${OOD_DOMAIN:-${OOD_ALB_DNS:-$(imds_get public-hostname)}}"
-  echo "=== Generating ood_portal.yml (servername=${SERVERNAME}) ==="
+  echo "=== Generating ood_portal.yml (Dex + LDAP connector, servername=${SERVERNAME}) ==="
 
+  # Derive an LDAP base DN from the directory domain (ood.internal -> dc=ood,dc=internal);
+  # used only to default the user-search / bind DNs when the operator did not set them.
+  _BASE_DN="dc=$(echo "${OOD_DIRECTORY_NAME}" | sed 's/\./,dc=/g')"
+  _USER_BASE_DN="${OOD_DIRECTORY_USER_BASE_DN:-CN=Users,${_BASE_DN}}"
+  _BIND_DN="${OOD_DIRECTORY_BIND_DN:-CN=Administrator,CN=Users,${_BASE_DN}}"
+  _USER_FILTER="${OOD_DIRECTORY_USER_FILTER:-(objectClass=person)}"
+  _USERNAME_ATTR="${OOD_DIRECTORY_USERNAME_ATTR:-sAMAccountName}"
+  # Dex's LDAP host is the directory endpoint with no scheme (host:port). Strip ldaps:// etc.
+  _LDAP_HOST="${OOD_DIRECTORY_LDAP_URI#*://}"
+  case "${_LDAP_HOST}" in *:*) : ;; *) _LDAP_HOST="${_LDAP_HOST}:636" ;; esac
+
+  # The bind password is interpolated into a separate, root-only file rather than echoed into
+  # logs. ood_portal.yml itself is world-readable, so we keep the password OUT of it by using
+  # Dex's bindPW directly here — ood_portal.yml is 0600 below to protect it.
+  umask 077
   cat > /etc/ood/config/ood_portal.yml <<OODPORTAL
 ---
 servername: "${SERVERNAME}"
-oidc_uri: /oidc
-oidc_discover_uri: /oidc/.well-known/openid-configuration
-oidc_discover_root: /var/www/ood/discover
-oidc_provider_metadata_url: "${OOD_OIDC_ISSUER_URL}/.well-known/openid-configuration"
-oidc_client_id: "${OOD_OIDC_CLIENT_ID}"
-oidc_client_secret: "${OOD_OIDC_CLIENT_SECRET}"
-# Identity claim to local Unix username. History:
-#  - #64 moved off preferred_username (absent under this pool, caused HTTP 400) to cognito:username.
-#  - #75: but with username_attributes set to email, cognito:username is the Cognito sub UUID,
-#    which useradd rejects (invalid name), so no account is created and the PUN 404s. Key on
-#    the email claim and use mod_auth_openidc's two-argument OIDCRemoteUserClaim regex form to
-#    extract the email local-part as REMOTE_USER (demo@example.com becomes demo).
-#    ood-portal-generator emits the OIDCRemoteUserClaim value verbatim, so the
-#    claim-then-regex form passes through. The local-part is a valid Unix name (no --badname)
-#    and matches nginx_stage's user_regex. Single-domain assumption: demo@a.edu and
-#    demo@b.edu would collide (acceptable here).
-#  NOTE: keep shell metacharacters (backticks, angle brackets, dollar-paren) out of this
-#  comment — the heredoc is unquoted for variable expansion and would evaluate them at boot.
-# The provisioning hook receives this same REMOTE_USER via --user, so #39/#67/#71 stay
-# consistent automatically. ^([^@]+)@ captures everything before the first @.
-oidc_remote_user_claim: "email ^([^@]+)@"
-oidc_scope: "openid email profile"
-oidc_session_inactivity_timeout: 28800
-oidc_session_max_duration: 28800
-# #60: behind the ALB, TLS is terminated at the ALB and forwarded to Apache as plain
-# HTTP on :80. Without this, mod_auth_openidc derives the OIDC redirect_uri scheme from
-# the (HTTP) request and builds an http:// redirect_uri, which Cognito rejects (OIDC
-# requires https except for localhost) and which mismatches the registered https callback.
-# OIDCXForwardedHeaders makes mod_auth_openidc honor the ALB's forwarded headers so it
-# builds an https:// redirect_uri. ood-portal-generator passes oidc_settings through into
-# the mod_auth_openidc <Macro> block verbatim.
-# #73: ONLY X-Forwarded-Proto. That alone fixes the http→https scheme (the #60/#64 goal).
-# Honoring X-Forwarded-Port too made mod_auth_openidc append the ALB's :443 to the
-# redirect_uri (https://host:443/oidc), but the Cognito callback registered by terraform/CDK
-# is port-less (https://host/oidc), and Cognito does exact-string matching → redirect_mismatch
-# before login. :443 is the https default and adds nothing, so dropping it keeps the
-# redirect_uri byte-identical to the registered callback. (X-Forwarded-Host is also omitted —
-# the ALB does not send it.)
-oidc_settings:
-  OIDCXForwardedHeaders: "X-Forwarded-Proto"
-# No user_map_cmd: OOD maps the authenticated identity to a local user via
-# oidc_remote_user_claim (above). oidc-pam v0.3.x provides no map command — the
-# /usr/local/bin/oidc-pam map-user path never existed (scttfrdmn/oidc-pam#87).
-#
-# 52: the oidc_ keys above are necessary but NOT sufficient. ood-portal-generator's
-# view.rb only emits the mod_auth_openidc vhost stanza when auth? is true, i.e. when the
-# auth list is non-empty. Without this block the generator silently falls back to the
-# need_auth config (RewriteRule to /public/need_auth.html) and browser login fails even
-# with a correct OIDC config, loaded module, and live broker. (Keep shell-substitution
-# metacharacters out of this heredoc body — it is unquoted for variable expansion, so
-# they would be evaluated at boot.)
-auth:
-  - 'AuthType openid-connect'
-  - 'Require valid-user'
+dex:
+  connectors:
+    - type: ldap
+      id: directory
+      name: Directory
+      config:
+        host: "${_LDAP_HOST}"
+        insecureSkipVerify: true
+        bindDN: "${_BIND_DN}"
+        bindPW: "${OOD_DIRECTORY_BIND_PW}"
+        userSearch:
+          baseDN: "${_USER_BASE_DN}"
+          filter: "${_USER_FILTER}"
+          username: "${_USERNAME_ATTR}"
+          idAttr: "${_USERNAME_ATTR}"
+          emailAttr: mail
+          nameAttr: cn
 OODPORTAL
+  chmod 600 /etc/ood/config/ood_portal.yml
+  umask 022
 
-  # #71: wire account provisioning on the WEB-login path through ood_portal.yml — NOT
-  # nginx_stage.yml. Mechanism (verified against OOD 4.0.10 source):
-  #   1. ood-portal-generator (view.rb) reads `pun_pre_hook_root_cmd` / `pun_pre_hook_exports`
-  #      from ood_portal.yml.
-  #   2. It emits `SetEnv OOD_PUN_PRE_HOOK_ROOT_CMD ...` / `OOD_PUN_PRE_HOOK_EXPORTS ...` into
-  #      the Apache vhost (ood-portal.conf).
-  #   3. mod_ood_proxy/Lua forward those to `nginx_stage pun --pre-hook-root=<cmd>` at PUN
-  #      staging time, which runs the hook as root with `--user <mapped-user>`.
-  # `pre_hook_root_cmd` is a per-invocation nginx_stage CLI option (default nil) and is NOT a
-  # valid global nginx_stage.yml key — earlier attempts (#67 in the wrong file, #69 with the
-  # nginx_stage key) were both rejected as invalid options. The exports list IS honored here
-  # (unlike nginx_stage.yml), so we forward the UID table + region; the helper also still
-  # falls back to /etc/oidc-auth/provision.env.
-  if [ -n "${OOD_DYNAMODB_UID_TABLE}" ]; then
-    cat >> /etc/ood/config/ood_portal.yml <<PORTALHOOK
-pun_pre_hook_root_cmd: "/usr/local/bin/ood-provision-user"
-pun_pre_hook_exports: "OOD_DYNAMODB_UID_TABLE,AWS_REGION"
-PORTALHOOK
-  fi
-
-  # Regenerate OOD Apache config from the portal YAML
+  # Regenerate the Apache config from the portal YAML; the generator owns the OIDC vhost.
   if command -v /opt/ood/ood-portal-generator/sbin/update_ood_portal &>/dev/null; then
     /opt/ood/ood-portal-generator/sbin/update_ood_portal
-    # #71: confirm the generated Apache config actually carries the pre-hook SetEnv — if the
-    # generator silently dropped the key, provisioning won't run on web login. Warn loudly.
-    if [ -n "${OOD_DYNAMODB_UID_TABLE}" ] && ! grep -q "OOD_PUN_PRE_HOOK_ROOT_CMD" /etc/httpd/conf.d/ood-portal.conf 2>/dev/null; then
-      echo "ERROR: ood-portal.conf has no OOD_PUN_PRE_HOOK_ROOT_CMD SetEnv (#71) — account provisioning will NOT run on web login; check the pun_pre_hook_root_cmd key in ood_portal.yml."
-    fi
-    # #38/#52: the generator silently degrades to the need_auth fallback (RewriteRule ->
-    # /public/need_auth.html) if mod_auth_openidc isn't loadable OR the auth: block is
-    # missing. Assert the rendered vhost actually carries the OIDC directive
-    # ('openid-connect') rather than a loose "oidc" substring match — need_auth.html does
-    # not contain it, so this catches both failure modes. Warn loudly so the cause is
-    # visible instead of a portal stuck on "you need to setup authentication".
+    # Assert the generator emitted the OIDC vhost (not the need_auth fallback). With a dex:
+    # block present this should always hold; warn loudly if not.
     if ! grep -qi "openid-connect" /etc/httpd/conf.d/ood-portal.conf 2>/dev/null; then
-      echo "ERROR: ood-portal.conf has no 'openid-connect' AuthType — generator fell back to need_auth (#38/#52). Check mod_auth_openidc is installed and ood_portal.yml has an auth: block. Web login will fail."
+      echo "ERROR: ood-portal.conf has no 'openid-connect' AuthType (#78) — generator fell back to need_auth. Check ondemand-dex is installed and the dex: block is valid. Web login will fail."
     fi
   fi
+  systemctl enable --now ondemand-dex 2>/dev/null || systemctl restart ondemand-dex 2>/dev/null || true
 fi
+
 
 ###############################################################################
 # 5. Generate cluster YAML files for each enabled adapter
@@ -825,7 +596,8 @@ fi
 ###############################################################################
 # 8. Start / reload services
 ###############################################################################
-systemctl start oidc-auth-broker 2>/dev/null || true
+# #78: ondemand-dex is the OIDC provider (started in the web-auth block above when use_sssd);
+# nothing to start here for the retired oidc-auth-broker.
 
 # OOD 4.x on AL2023 uses httpd.service with drop-in configs from the ondemand package
 systemctl enable --now httpd || true

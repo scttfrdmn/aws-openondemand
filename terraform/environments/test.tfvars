@@ -26,8 +26,6 @@ deployment_profile = "minimal" # t3.medium, on-demand, ~$30/mo
 # Each toggle tips OOD further into the cloud. See docs/architecture.md.
 enable_efs                   = true  # Level 1: /home on EFS — instance is replaceable
 enable_efs_one_zone          = true  # Single-AZ EFS, ~47% cheaper
-enable_dynamodb_uid          = true  # Level 2: UID mapping replaces LDAP (~$1/mo)
-use_cognito                  = true  # Level 3: Cognito for OIDC (free tier)
 enable_session_cache         = false # Level 5: PUN sessions in ElastiCache (not needed without spot)
 enable_s3_browser            = false # Level 6: S3 browsing in file manager
 enable_cloudwatch_accounting = false # Level 7: per-user cost tracking
