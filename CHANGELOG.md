@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Per-user cross-account AWS identity for compute adapters (#78 PR C, default off). With
+  `enable_per_user_roles=true` + `per_user_role_arn_template` (a role ARN with a `{username}`
+  placeholder, e.g. `arn:aws:iam::ACCOUNT:role/ood-user-{username}`), every backend adapter
+  receives `--assume-role-arn`/`--assume-role-external-id` via its `clusters.d` config and
+  assumes the *logged-in user's* role in the user's own account — expanding `{username}` from
+  the runtime user (OOD runs the adapter as that user). The instance role is granted
+  `sts:AssumeRole` only on the `…/ood-user-*` pattern; the per-user role + trust policy live in
+  the user's account (operator-created — see reference-architecture.md §4). Default off ⇒
+  adapters use the OOD instance role directly (single-account on-ramp, unchanged). Requires the
+  adapter binaries at v0.1.2+ (the `{username}`-expanding `--assume-role-arn`). Dual-IaC (TF +
+  CDK). **Not live-testable until a multi-account topology exists** — the dormant default-off
+  path ships nothing that affects single-account deployments.
+
 ### Changed
 - **Identity pivot — Dex + SSSD replaces the bespoke Cognito/oidc-pam/DynamoDB stack (#78,
   closes #77).** Web auth is now OOD's bundled **Dex** with an **LDAP connector** bound to a

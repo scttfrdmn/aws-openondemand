@@ -75,6 +75,11 @@ locals {
   enable_braket             = contains(var.adapters_enabled, "braket")
   enable_bedrock            = contains(var.adapters_enabled, "bedrock")
 
+  # #78 PR C: the IAM resource for the instance role's sts:AssumeRole grant — the per-user
+  # role template with {username} replaced by a wildcard, so the instance role may assume any
+  # user's role matching the pattern (the user-account trust policy is the real gate).
+  per_user_role_resource = var.enable_per_user_roles ? replace(var.per_user_role_arn_template, "{username}", "*") : ""
+
   # #79: deletion protection is on only in prod. Terraform's lifecycle.prevent_destroy must
   # be a literal (can't read a var), and using it blocked `terraform destroy` of a test env
   # entirely (all-or-nothing) — forcing manual `state rm` and risking orphaned billing
@@ -1144,7 +1149,9 @@ resource "aws_launch_template" "ood" {
     "export OOD_LOG_GROUP_PREFIX='/aws/ec2/ood-${var.environment}'",
     "export OOD_DOMAIN='${var.domain_name}'",
     "export OOD_ALB_DNS='${var.enable_alb ? aws_lb.ood[0].dns_name : ""}'",
-    "export OOD_USE_SSSD='${tostring(var.use_sssd)}'",        # #78: directory-backed POSIX identity
+    "export OOD_USE_SSSD='${tostring(var.use_sssd)}'",                                                   # #78: directory-backed POSIX identity
+    "export OOD_PER_USER_ROLE_ARN='${var.enable_per_user_roles ? var.per_user_role_arn_template : ""}'", # #78 PR C: per-user AssumeRole ({username} expanded by the adapter)
+    "export OOD_PER_USER_ROLE_EXTERNAL_ID='${var.enable_per_user_roles ? var.per_user_role_external_id : ""}'",
     "export ARTIFACT_BUCKET='${aws_s3_bucket.artifacts.id}'", # exported so the fetched userdata.sh child inherits it (#49)
     ],
     # bake.sh runs at boot only on the base AL2023 AMI; with a pre-baked AMI it was
