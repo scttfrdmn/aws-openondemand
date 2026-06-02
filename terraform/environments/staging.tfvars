@@ -24,8 +24,6 @@ deployment_profile = "graviton" # m7g.xlarge ARM64, ~$112/mo
 # --- Cloud-native progression ---
 enable_efs                   = true  # Level 1: /home on EFS
 enable_efs_one_zone          = false # Multi-AZ for durability
-enable_dynamodb_uid          = true  # Level 2: no LDAP
-use_cognito                  = true  # Level 3: institutional SSO
 enable_session_cache         = false # Level 5: enable if using spot profile
 enable_s3_browser            = true  # Level 6: researchers access S3 data from OOD
 enable_cloudwatch_accounting = true  # Level 7: per-user cost tracking for cloud jobs
@@ -45,9 +43,6 @@ enable_packer_ami          = false # Set true after building AMI with Packer
 
 # --- Compute backends ---
 adapters_enabled = ["batch", "sagemaker"]
-
-# --- Identity ---
-# cognito_saml_metadata_url = "https://idp.university.edu/metadata"
 
 # --- Batch settings ---
 batch_spot_enabled = true

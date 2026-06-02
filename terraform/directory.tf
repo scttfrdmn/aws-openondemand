@@ -8,9 +8,9 @@
 #   - non-prod: Simple AD (Samba 4, ~$36/mo for Small) — fine for the prototype/smoke test.
 #   - prod:     Managed Microsoft AD — production-grade, multi-AZ, trust-capable.
 # SSSD uses id_provider=ad + ldap_id_mapping=True (algorithmic uids — no manual POSIX attrs).
-# Cognito (kept as the OIDC IdP) is federated to this directory so the OIDC username == the
-# AD account SSSD resolves. directory_ldap_uri can override the SSSD target with an on-prem
-# AD/LDAP for the real topology (no code change).
+# Web auth is OOD's bundled Dex with an LDAP connector bound to THIS SAME directory (no
+# Cognito), so the OIDC username == the AD account SSSD resolves, by construction.
+# directory_ldap_uri can override the SSSD/Dex target with an on-prem AD/LDAP (no code change).
 #
 # Requires >=2 subnets in different AZs (same constraint as the ALB).
 # ---------------------------------------------------------------------------
@@ -36,6 +36,27 @@ resource "aws_secretsmanager_secret" "directory_admin" {
 resource "aws_secretsmanager_secret_version" "directory_admin" {
   count         = var.enable_directory ? 1 : 0
   secret_id     = aws_secretsmanager_secret.directory_admin[0].id
+  secret_string = random_password.directory_admin[0].result
+}
+
+# #78 PR B: the Dex LDAP connector binds to the directory with this password. In eval mode
+# (enable_directory) it auto-fills from the Simple AD admin password; in BYO/production mode
+# the operator populates this secret out-of-band (the secret is created so the OOD host's read
+# policy + the userdata fetch are stable regardless of mode). The OOD host fetches it at boot
+# to write the Dex bindPW; it is never in user_data or SSM.
+resource "aws_secretsmanager_secret" "directory_bind" {
+  count                   = var.use_sssd ? 1 : 0
+  name                    = "ood/${var.environment}/directory-bind-password"
+  description             = "#78: LDAP bind password for the Dex connector"
+  kms_key_id              = var.enable_kms_cmk ? aws_kms_key.ood[0].arn : null
+  recovery_window_in_days = local.prod_protected ? 30 : 0
+}
+
+# Eval mode: seed the bind secret from the Simple AD admin password. BYO mode: the operator
+# sets it (so we do NOT manage a version here when there's no provisioned directory).
+resource "aws_secretsmanager_secret_version" "directory_bind" {
+  count         = var.use_sssd && var.enable_directory ? 1 : 0
+  secret_id     = aws_secretsmanager_secret.directory_bind[0].id
   secret_string = random_password.directory_admin[0].result
 }
 
@@ -81,17 +102,43 @@ resource "aws_ssm_parameter" "directory_dns_ips" {
   value = join(",", aws_directory_service_directory.ood[0].dns_ip_addresses)
 }
 
-# Allow the OOD instance role to read the directory admin password for the domain join.
-resource "aws_iam_role_policy" "directory_admin_read" {
-  count       = var.enable_directory ? 1 : 0
-  name_prefix = "ood-directory-admin-"
+# #78 PR B: directory coordinates the OOD host reads to configure SSSD + the Dex LDAP
+# connector. Published whenever use_sssd (so BYO mode without a provisioned directory still
+# gets them). directory_ldap_uri prefers the explicit override, else the provisioned endpoint.
+resource "aws_ssm_parameter" "directory_ldap_uri" {
+  count = var.use_sssd && var.enable_parameter_store ? 1 : 0
+  name  = "/ood/${var.environment}/directory_ldap_uri"
+  type  = "String"
+  value = local.directory_ldap_uri
+}
+
+resource "aws_ssm_parameter" "directory_coords" {
+  for_each = (var.use_sssd && var.enable_parameter_store) ? {
+    directory_bind_dn       = var.directory_bind_dn
+    directory_user_base_dn  = var.directory_user_base_dn
+    directory_user_filter   = var.directory_user_filter
+    directory_username_attr = var.directory_username_attr
+  } : {}
+  name = "/ood/${var.environment}/${each.key}"
+  type = "String"
+  # SSM rejects empty String values; emit a single space for unset (the script treats it as unset).
+  value = each.value != "" ? each.value : " "
+}
+
+# Allow the OOD instance role to read the directory admin + bind passwords (domain join + Dex bind).
+resource "aws_iam_role_policy" "directory_secrets_read" {
+  count       = var.use_sssd || var.enable_directory ? 1 : 0
+  name_prefix = "ood-directory-secrets-"
   role        = aws_iam_role.ood.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = ["secretsmanager:GetSecretValue"]
-      Resource = aws_secretsmanager_secret.directory_admin[0].arn
+      Effect = "Allow"
+      Action = ["secretsmanager:GetSecretValue"]
+      Resource = compact([
+        var.enable_directory ? aws_secretsmanager_secret.directory_admin[0].arn : "",
+        var.use_sssd ? aws_secretsmanager_secret.directory_bind[0].arn : "",
+      ])
     }]
   })
 }

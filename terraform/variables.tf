@@ -66,7 +66,7 @@ variable "deployment_profile" {
       standard — m6i.xlarge x86_64 on-demand (~$140/mo). Departmental use.
       graviton — m7g.xlarge ARM64 on-demand (~$115/mo). ~20% cheaper than standard.
       spot     — m6i.xlarge x86_64 spot pricing (~$14–28/mo compute).
-                 Requires enable_efs=true, enable_dynamodb_uid=true, use_cognito=true.
+                 Requires enable_efs=true (EFS-backed /home survives Spot interruption).
       large    — m6i.2xlarge x86_64 on-demand (~$280/mo). High-concurrency portal.
     Use instance_type to override the profile's default instance size.
   EOT
@@ -83,44 +83,6 @@ variable "instance_type" {
 }
 
 # ---------------------------------------------------------------------------
-# Identity / Auth
-# ---------------------------------------------------------------------------
-
-variable "use_cognito" {
-  type        = bool
-  default     = true
-  description = "Provision a Cognito User Pool + App Client for OIDC auth (Level 3 cloud-native)"
-}
-
-variable "cognito_mfa_required" {
-  type        = bool
-  default     = false
-  description = <<-EOT
-    When true, set Cognito MFA to REQUIRED (ON) instead of OPTIONAL.
-    Recommended for prod after all users have enrolled TOTP.
-    Set cognito_mfa_required=true in prod.tfvars once MFA enrollment is complete.
-  EOT
-}
-
-variable "cognito_saml_metadata_url" {
-  type        = string
-  default     = ""
-  description = "SAML metadata URL for InCommon/Shibboleth federation via Cognito (optional — requires use_cognito=true)"
-}
-
-variable "oidc_client_id" {
-  type        = string
-  default     = ""
-  description = "OIDC client ID (from Cognito App Client or external IdP). Auto-populated from Cognito when use_cognito=true."
-}
-
-variable "oidc_issuer_url" {
-  type        = string
-  default     = ""
-  description = "OIDC issuer URL. Auto-populated from Cognito User Pool when use_cognito=true."
-}
-
-# ---------------------------------------------------------------------------
 # Cloud-native progression toggles
 # ---------------------------------------------------------------------------
 
@@ -134,12 +96,6 @@ variable "enable_efs_one_zone" {
   type        = bool
   default     = false
   description = "Use single-AZ EFS (~47% cheaper). Automatically true for test environment."
-}
-
-variable "enable_dynamodb_uid" {
-  type        = bool
-  default     = true
-  description = "Provision a DynamoDB UID mapping table replacing LDAP (Level 2)"
 }
 
 variable "enable_session_cache" {
@@ -262,33 +218,10 @@ variable "enable_packer_ami" {
   description = "Use a pre-baked OOD AMI (ood-base-*) when available; falls back to AL2023 base AMI. Reduces bootstrap from 10-15 min to 3-5 min."
 }
 
-variable "oidc_pam_version" {
-  type        = string
-  default     = "v0.3.3"
-  description = "oidc-pam release tag the baked AMI ships. userdata.sh uses it as a runtime fallback to install oidc-pam/oidc-auth-broker at boot if the AMI is missing the binary (#26/#34). Should match the version baked via packer's oidc_pam_version."
-  validation {
-    condition     = can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+", var.oidc_pam_version))
-    error_message = "oidc_pam_version must be a semantic version tag starting with 'v' (e.g. v0.3.3)."
-  }
-}
-
 variable "enable_parameter_store" {
   type        = bool
   default     = true
   description = "Store runtime configuration in SSM Parameter Store and source at instance launch"
-}
-
-# H2: provide a pre-deployed rotation Lambda ARN to enable automatic OIDC client
-# secret rotation. Without this, the secret must be rotated manually.
-# See docs/identity-guide.md for instructions on building the rotation Lambda.
-variable "oidc_secret_rotation_lambda_arn" {
-  type        = string
-  default     = ""
-  description = "ARN of a Lambda function to rotate the Cognito OIDC client secret. Empty = no automatic rotation (manual rotation required every 90 days)."
-  validation {
-    condition     = var.oidc_secret_rotation_lambda_arn == "" || can(regex("^arn:aws[a-z-]*:lambda:[a-z0-9-]+:[0-9]{12}:function:", var.oidc_secret_rotation_lambda_arn))
-    error_message = "oidc_secret_rotation_lambda_arn must be a valid Lambda function ARN (arn:aws[...]:lambda:<region>:<account>:function:<name>)."
-  }
 }
 
 # ---------------------------------------------------------------------------
@@ -359,4 +292,39 @@ variable "directory_ldap_schema" {
   type        = string
   default     = "ad"
   description = "#78: SSSD ldap_schema (ad for AWS Directory Service / Active Directory; rfc2307bis for a POSIX LDAP)."
+}
+
+# ---------------------------------------------------------------------------
+# #78 PR B: Dex LDAP connector — web-auth bind contract.
+# OOD's bundled Dex authenticates users via an LDAP connector bound to the SAME directory SSSD
+# reads, so the OIDC username == the POSIX account by construction. These describe how Dex
+# binds and searches the directory. For the eval Simple AD they default to sensible values
+# derived from directory_name; for BYO production the operator sets them to match their AD/LDAP.
+# The bind PASSWORD is never a variable — it lives in the Secrets Manager secret
+# ood/<env>/directory-bind-password (operator-populated for BYO; auto-filled from the Simple AD
+# admin secret in eval mode).
+# ---------------------------------------------------------------------------
+
+variable "directory_bind_dn" {
+  type        = string
+  default     = ""
+  description = "#78: LDAP bind DN Dex uses to search the directory (e.g. CN=ood-bind,OU=Service,DC=ood,DC=internal). Empty + enable_directory derives the Simple AD Administrator DN from directory_name."
+}
+
+variable "directory_user_base_dn" {
+  type        = string
+  default     = ""
+  description = "#78: base DN under which Dex searches for users (e.g. CN=Users,DC=ood,DC=internal). Empty + enable_directory derives it from directory_name."
+}
+
+variable "directory_user_filter" {
+  type        = string
+  default     = "(objectClass=person)"
+  description = "#78: LDAP filter for the Dex userSearch."
+}
+
+variable "directory_username_attr" {
+  type        = string
+  default     = "sAMAccountName"
+  description = "#78: AD/LDAP attribute Dex uses as the OOD username. sAMAccountName (AD) yields a bare name (demo) that matches the POSIX account SSSD resolves — NOT userPrincipalName/email (which would mismatch)."
 }
