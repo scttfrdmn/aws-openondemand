@@ -83,6 +83,15 @@ locals {
   # S3 force_destroy, all keyed on this flag. prod stays protected; non-prod tears down clean.
   prod_protected = var.environment == "prod"
 
+  # #78: directory-backed identity (AWS Directory Service + SSSD). enable_directory provisions
+  # the managed AD; use_sssd configures NSS/SSSD on the OOD host. The LDAP URI SSSD reads is
+  # either the operator-supplied directory_ldap_uri (on-prem AD/LDAP) or, when enable_directory
+  # and no override is given, the provisioned AWS Directory Service DNS endpoint. Keeps the
+  # directory host swappable (prototype managed-AD <-> on-prem AD) with no code change.
+  directory_ldap_uri = var.directory_ldap_uri != "" ? var.directory_ldap_uri : (
+    var.enable_directory ? "ldaps://${var.directory_name}" : ""
+  )
+
   # Precondition: spot profile requires cloud-native stack
   # (enforced below via lifecycle precondition on the ASG)
   spot_prereqs_met = !local.use_spot || (var.enable_efs && var.enable_dynamodb_uid && var.use_cognito)
@@ -1461,6 +1470,7 @@ resource "aws_launch_template" "ood" {
     "export OOD_DOMAIN='${var.domain_name}'",
     "export OOD_ALB_DNS='${var.enable_alb ? aws_lb.ood[0].dns_name : ""}'",
     "export OOD_OIDC_PAM_VERSION='${var.oidc_pam_version}'",
+    "export OOD_USE_SSSD='${tostring(var.use_sssd)}'",        # #78: directory-backed POSIX identity
     "export ARTIFACT_BUCKET='${aws_s3_bucket.artifacts.id}'", # exported so the fetched userdata.sh child inherits it (#49)
     ],
     # bake.sh runs at boot only on the base AL2023 AMI; with a pre-baked AMI it was

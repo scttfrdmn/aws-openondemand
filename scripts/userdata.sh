@@ -58,6 +58,8 @@ if [ "${OOD_ENABLE_PARAMETER_STORE}" = "true" ]; then
         oidc_issuer_url) OOD_OIDC_ISSUER_URL="${value}" ;;
         redis_endpoint) OOD_REDIS_ENDPOINT="${value}" ;;
         broker_token_key) OOD_BROKER_TOKEN_KEY="${value}" ;; # #37: broker token_encryption_key
+        directory_name) OOD_DIRECTORY_NAME="${value}" ;;     # #78: SSSD/AD domain
+        directory_dns_ips) OOD_DIRECTORY_DNS_IPS="${value}" ;; # #78: AD DNS resolvers
       esac
     done <"${SSM_DUMP}"
     echo "=== SSM parameters loaded ==="
@@ -73,6 +75,9 @@ OOD_OIDC_CLIENT_ID="${OOD_OIDC_CLIENT_ID:-}"
 OOD_OIDC_CLIENT_SECRET_ARN="${OOD_OIDC_CLIENT_SECRET_ARN:-}"
 OOD_OIDC_ISSUER_URL="${OOD_OIDC_ISSUER_URL:-}"
 OOD_BROKER_TOKEN_KEY="${OOD_BROKER_TOKEN_KEY:-}"
+OOD_DIRECTORY_NAME="${OOD_DIRECTORY_NAME:-}"
+OOD_DIRECTORY_DNS_IPS="${OOD_DIRECTORY_DNS_IPS:-}"
+OOD_USE_SSSD="${OOD_USE_SSSD:-false}"
 
 # Fetch OIDC client secret from Secrets Manager (never stored in SSM or userdata) (H2)
 OOD_OIDC_CLIENT_SECRET=""
@@ -101,6 +106,71 @@ if [ -n "${OOD_OIDC_CLIENT_SECRET_ARN}" ]; then
   rm -f "${SM_ERROR_LOG}"
 fi
 OOD_REDIS_ENDPOINT="${OOD_REDIS_ENDPOINT:-}"
+
+###############################################################################
+# #78: POSIX identity via SSSD/NSS against AWS Directory Service (or any AD/LDAP)
+#
+# Replaces the bespoke login-time-useradd path (#39->#77, which can't work: nginx_stage's
+# getpwnam runs before any provisioning hook). With SSSD joined to the directory, getpwnam
+# resolves users directory-side and oddjob-mkhomedir creates their home on first login — no
+# account creation at request time. Gated on use_sssd; coexists with the legacy oidc-pam path
+# until the cutover (#78-5). Idempotent: re-running re-joins only if not already joined.
+###############################################################################
+if [ "${OOD_USE_SSSD}" = "true" ] && [ -n "${OOD_DIRECTORY_NAME}" ]; then
+  echo "=== Configuring SSSD against directory ${OOD_DIRECTORY_NAME} ==="
+
+  # Point DNS at the directory's resolvers so the AD domain + SRV records resolve. AWS
+  # Directory Service publishes two DNS IPs (from the directory_dns_ips SSM StringList).
+  if [ -n "${OOD_DIRECTORY_DNS_IPS}" ]; then
+    {
+      echo "[main]"
+      echo "dns=none"
+    } > /etc/NetworkManager/conf.d/dns-none.conf 2>/dev/null || true
+    : > /etc/resolv.conf
+    for _ip in ${OOD_DIRECTORY_DNS_IPS//,/ }; do
+      echo "nameserver ${_ip}" >> /etc/resolv.conf
+    done
+    echo "search ${OOD_DIRECTORY_NAME}" >> /etc/resolv.conf
+  fi
+
+  # Fetch the directory admin password from Secrets Manager (never in user_data) for the join.
+  DIR_ADMIN_PW=$(aws secretsmanager get-secret-value \
+    --region "${AWS_REGION}" \
+    --secret-id "ood/${OOD_ENVIRONMENT}/directory-admin-password" \
+    --query 'SecretString' --output text 2>/dev/null || echo "")
+
+  if [ -z "${DIR_ADMIN_PW}" ]; then
+    echo "ERROR: could not fetch directory admin password (#78) — SSSD join skipped; getpwnam will fail and the PUN won't start. Check the instance role has secretsmanager:GetSecretValue on ood/${OOD_ENVIRONMENT}/directory-admin-password."
+  else
+    # Join the realm if not already joined (idempotent across reboots / ASG replacement).
+    if ! realm list 2>/dev/null | grep -qi "${OOD_DIRECTORY_NAME}"; then
+      echo "${DIR_ADMIN_PW}" | realm join --user=Admin "${OOD_DIRECTORY_NAME}" 2>&1 \
+        && echo "=== realm join succeeded ===" \
+        || echo "ERROR: realm join failed (#78) — check directory reachability + admin creds."
+    else
+      echo "=== already joined to ${OOD_DIRECTORY_NAME} ==="
+    fi
+    unset DIR_ADMIN_PW
+
+    # Enable the SSSD nsswitch profile and auto-home-creation. authselect rewrites
+    # /etc/nsswitch.conf + /etc/pam.d to resolve users via SSSD and run pam_oddjob_mkhomedir.
+    authselect select sssd with-mkhomedir --force 2>&1 || \
+      echo "WARNING: authselect select sssd failed (#78)"
+
+    # fully-qualified-names off so 'demo' works (not 'demo@domain'); homes under /home.
+    if [ -f /etc/sssd/sssd.conf ]; then
+      sed -i 's/^use_fully_qualified_names.*/use_fully_qualified_names = False/' /etc/sssd/sssd.conf 2>/dev/null || true
+      grep -q '^use_fully_qualified_names' /etc/sssd/sssd.conf || \
+        sed -i "/^\[domain\//a use_fully_qualified_names = False\nfallback_homedir = /home/%u\ndefault_shell = /bin/bash\nldap_id_mapping = True" /etc/sssd/sssd.conf 2>/dev/null || true
+    fi
+
+    systemctl enable --now oddjobd 2>/dev/null || true
+    systemctl restart sssd 2>/dev/null || systemctl enable --now sssd 2>/dev/null || true
+
+    # Assert getpwnam resolves a directory user (best-effort; warns, doesn't block boot).
+    echo "=== SSSD configured; 'id' resolution now directory-backed (no login-time useradd) ==="
+  fi
+fi
 
 ###############################################################################
 # 1. Mount EFS /home (with TLS + IAM)

@@ -312,3 +312,51 @@ variable "cloudwatch_log_retention" {
   default     = 0
   description = "CloudWatch log retention in days (0 = use environment default: test=7, staging=30, prod=90)"
 }
+
+# ---------------------------------------------------------------------------
+# #78: Directory-backed identity (AWS Directory Service + SSSD/NSS)
+#
+# Replaces the bespoke oidc-pam + DynamoDB-UID + login-time-useradd stack (#39->#77,
+# architecturally unworkable: nginx_stage getpwnam runs before any hook) with OOD's native
+# model. The two identity concerns are independent:
+#   - Web authn (OIDC): KEEP Cognito (managed, already built) — just move the Apache vhost to
+#     generator-owned config so the #52/#60/#73 hand-wiring class can't recur.
+#   - POSIX identity: resolve directory-side via NSS/SSSD so getpwnam succeeds with NO account
+#     creation at login. The directory is AWS Directory Service (managed: no servers, no DB) —
+#     Simple AD for non-prod, Managed Microsoft AD for prod. SSSD uses id_provider=ad +
+#     ldap_id_mapping (algorithmic uids). Federate Cognito to the AD so the OIDC username ==
+#     the AD/SSSD account by construction (kills the #64/#75 claim->username guessing).
+# directory_ldap_uri stays configurable so SSSD can target an on-prem AD/LDAP instead with no
+# code change (the real topology). Defaults OFF so existing deployments are unaffected until
+# the cutover (#78-5, post live validation).
+# ---------------------------------------------------------------------------
+
+variable "enable_directory" {
+  type        = bool
+  default     = false
+  description = "#78: provision an AWS Directory Service domain (Simple AD non-prod / Managed Microsoft AD prod) to serve POSIX identity for SSSD. When true the portal resolves users via the directory instead of the oidc-pam/DynamoDB-UID/login-useradd stack."
+}
+
+variable "use_sssd" {
+  type        = bool
+  default     = false
+  description = "#78: configure SSSD/NSS on the OOD host so authenticated users resolve via getpwnam against the directory (no login-time useradd). Pairs with enable_directory, or point directory_ldap_uri at an on-prem AD/LDAP."
+}
+
+variable "directory_name" {
+  type        = string
+  default     = "ood.internal"
+  description = "#78: fully-qualified AD domain name for AWS Directory Service (e.g. ood.example.com). Also the SSSD domain."
+}
+
+variable "directory_ldap_uri" {
+  type        = string
+  default     = ""
+  description = "#78: override LDAP(S) URI SSSD reads (e.g. an on-prem AD/LDAP: ldaps://ad.corp.example.com:636). Empty + enable_directory uses the provisioned AWS Directory Service endpoint. This is the swappable directory host."
+}
+
+variable "directory_ldap_schema" {
+  type        = string
+  default     = "ad"
+  description = "#78: SSSD ldap_schema (ad for AWS Directory Service / Active Directory; rfc2307bis for a POSIX LDAP)."
+}
